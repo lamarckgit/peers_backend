@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs & runtime
+logs/
+*.log
+
+# Secrets / credentials
+*.pem
+serviceAccountKey*.json
+constants.json.enc
+.env
+.env.*

@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Open Share</title>
+    <style>
+        /* Style for the big button */
+        #confirm-button {
+            display: inline-block;
+            padding: 20px 40px; /* Adjust padding for size */
+            font-size: 2rem; /* H1-like font size */
+            font-weight: bold; /* H1-like bold text */
+            background-color: #4CAF50; /* Green background */
+            color: white; /* White text color */
+            border: none; /* Remove border */
+            border-radius: 10px; /* Rounded corners */
+            cursor: pointer; /* Pointer cursor on hover */
+            text-align: center;
+        }
+
+        /* Hover effect for the button */
+        #confirm-button:hover {
+            background-color: #45a049; /* Slightly darker green on hover */
+        }
+
+        /* Blinking animation for the button */
+        @keyframes heartbeat {
+            0%, 100% {
+                background-color: gray; /* Gray tint at start and end */
+                transform: scale(1); /* Normal size */
+                opacity: 1; /* Full opacity */
+            }
+            50% {
+                background-color: lightgray; /* Lighter gray tint at peak */
+                transform: scale(1.1); /* Slightly larger size to mimic heartbeat */
+                opacity: 0.7; /* Reduced opacity for stronger contrast */
+            }
+        }
+
+        /* Apply blinking animation when active */
+        #confirm-button.blinking {
+            animation: heartbeat 1s infinite ease-in-out; /* Faster heartbeat effect with stronger contrast */
+            color: white; /* Keep text white during blinking */
+        }
+
+        /* Disabled button style (fallback if needed) */
+        #confirm-button:disabled {
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <!-- Button with initial text -->
+    <button id="confirm-button" data-linked-id="{{ link_id }}">Confirm to open the {{ door }}</button>
+
+    <script>
+        // const controller = new AbortController();
+        // const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+        // Add an event listener to handle button click
+        document.getElementById("confirm-button").addEventListener("click", async () => {
+            const button = document.getElementById("confirm-button");
+            const linkedId = button.getAttribute("data-linked-id");
+
+            // Change button text and add blinking effect
+            button.textContent = "Please wait, opening in progress";
+            button.classList.add("blinking"); // Start blinking animation
+            button.disabled = true;
+
+            try {
+                // Make an API call
+                const response = await fetch("/v1/start_open_share/", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ link_id: linkedId }),
+                    // signal: controller.signal
+                });
+                // clearTimeout(timeoutId);
+                if (response.ok) {
+                    // Parse the JSON response
+                    const data = await response.json();
+                    // Extract the uses_left value
+                    const usesLeft = data.uses_left;
+                    // Redirect to progress page if successful, including uses_left as a query parameter
+                    window.location.href = `/v1/progress?uses_left=${usesLeft}`;
+                } else {
+                    // Handle errors (optional)
+                    alert("Failure. Please try again.");
+                    resetButton(button); // Reset button state on error
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    console.log('Request timed out');
+                    alert("Timeout occurred.");
+                } else {
+                    console.error("Error:", error);
+                    alert("An unexpected error occurred.");
+                }
+                resetButton(button); // Reset button state on error
+            }
+        });
+
+        // Function to reset the button state in case of an error
+        function resetButton(button) {
+            button.textContent = "Confirm to open the {{ door }}"; // Reset text
+            button.classList.remove("blinking"); // Stop blinking animation
+            button.disabled = false; // Re-enable the button
+        }
+    </script>
+</body>
+</html>

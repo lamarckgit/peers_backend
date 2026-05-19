@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confirmation</title>
+    <style>
+        /* Style for the container to center content */
+        body {
+            margin: 0;
+            height: 100vh; /* Full viewport height */
+            display: flex;
+            flex-direction: column; /* for vertical space */
+            justify-content: center; /* Horizontally center */
+            align-items: center ; /* Vertically center */
+            height: 100vh; /* Full viewport height */
+            transform: translateY(-100px); /* Shift down by 100px */
+            background-color: #f9f9f9; /* Optional background color */
+        }
+
+        /* Style for the checkmark */
+        .checkmark {
+            color: green; /* Green color for the checkmark */
+            font-size: 150px; /* Big size for the checkmark */
+            font-weight: bold; /* Bold styling */
+            animation: fadeIn 0.5s ease-in-out; /* Optional fade-in animation */
+        }
+       /* Style for the failure X sign */
+        .failure {
+            color: red; /* Red color for the X sign */
+            font-size: 150px; /* Big size for the X sign */
+            font-weight: bold; /* Bold styling */
+            animation: fadeIn 0.5s ease-in-out; /* Optional fade-in animation */
+        }
+        .uses-text {
+            font-family: Verdana;
+            font-size: 28px;
+            font-weight: bold;
+            margin-top: 5px;
+            text-align: center;
+        }
+        .spacer {
+            height: 5px;
+        }
+        /* Optional fade-in animation */
+        @keyframes fadeIn {
+            0% {
+                opacity: 0;
+                transform: scale(0.5); /* Start smaller */
+            }
+            100% {
+                opacity: 1;
+                transform: scale(1); /* End at full size */
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Checkmark element -->
+    <div class="checkmark">✓</div>
+    <!-- Number of uses text -->
+    <div class="spacer"></div>
+    <div id="usesLeftText" class="uses-text"></div>
+    <div class="progress" hx-get="/v1/task_progress" hx-trigger="load, every 1s" hx-swap="innerHTML">
+        <!-- Progress bar will be dynamically updated -->
+        <div class="progress-bar" style="width: 0%"></div>
+    </div>
+    <script>
+        // Function to get query parameter value
+        function getQueryParam(name) {
+            const urlParams = new URLSearchParams(window.location.search);
+            return urlParams.get(name);
+        }
+        // Get the uses_left value from the URL
+        const usesLeft = getQueryParam('uses_left');
+        // Update the HTML with the uses_left value
+        if (usesLeft !== null) {
+            if (usesLeft < 1) {
+                document.getElementById('usesLeftText').textContent = 'No openings left';
+            } else {
+                document.getElementById('usesLeftText').textContent = `Openings left: ${usesLeft}`;
+            }
+        } else {
+            document.getElementById('usesLeftText').textContent = 'Opening is not available';
+        }
+    </script>
+</body>
+</html>
