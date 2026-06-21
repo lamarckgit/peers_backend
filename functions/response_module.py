@@ -1,5 +1,6 @@
 import secrets
 import uuid
+
 from functions.BLE_module import handle_open
 from crypt_class import SafeXSCrypt
 from functions import crypt_module
@@ -18,21 +19,40 @@ import time
 import firebase_admin
 from firebase_admin import credentials, messaging
 
-#    Make sure 'serviceAccountKey.json' is in the same directory.
+# BellXS / SafeXS Firebase apps are unused in this peers-only deployment. Their service-account
+# JSONs have been removed; the inherited lock/doorbell push helpers (open_bellxs_lock /
+# notify_safexs_doorbell / stop_safexs_doorbell_ring) are left importable but inert — they
+# early-return when their app is None. Only the PEERS.CLUB app below is actually used.
+app_bellxs = None
+app_safexs = None
+
+# --- Initialize PEERS.CLUB (used to push INCOMING_CHAT to a backgrounded peer) ---
+# Sending FCM to the peers.club iOS app (Firebase project "peers-club") requires THAT project's
+# own service-account key. Drop serviceAccountKeyPeersClub.json next to the other two. When it's
+# absent, background chat push is simply disabled — foreground chat over the WS relay still works.
+app_peers = None
 try:
-    # --- Initialize BellXS ---
-    cred_bell = credentials.Certificate("serviceAccountKeyBellXS.json")
-    app_bellxs = firebase_admin.initialize_app(cred_bell, name='bellxs_app')
-
-    # --- Initialize SafeXS ---
-    cred_safe = credentials.Certificate("serviceAccountKeySafeXS.json")
-    app_safexs = firebase_admin.initialize_app(cred_safe, name='safexs_app')
-
-    print("Both Firebase apps initialized successfully.")
-    # cred = credentials.Certificate("serviceAccountKey.json")
-    # firebase_admin.initialize_app(cred)
+    cred_peers = credentials.Certificate("serviceAccountKeyPeersClub.json")
+    app_peers = firebase_admin.initialize_app(cred_peers, name='peers_app')
+    print("PEERS.CLUB Firebase app initialized successfully.")
+except (FileNotFoundError, IOError):
+    print("PEERS.CLUB service account 'serviceAccountKeyPeersClub.json' not found — "
+          "background chat push disabled (foreground chat still works).")
 except ValueError:
-    print("Firebase Admin SDK already initialized or 'serviceAccountKey.json' not found.")
+    print("PEERS.CLUB Firebase app already initialized.")
+
+class ResponseCreatePeer(BaseModel):
+    success: bool
+    uuid: str
+    error: str
+
+class ResponsePeer(BaseModel):
+    success: bool
+    uuid: str
+    name: str
+    about_me: str
+    image_data: str = None
+    error: str
 
 class ResponseBLE(BaseModel):
     phone_id: str
@@ -63,7 +83,6 @@ class ResponseLicense(BaseModel):
     license_keys: int
     license_peripherals: int
     license_expiry_date: str
-
 
 class ResponseOpenOnline(BaseModel):
     payload: str
@@ -101,7 +120,7 @@ def get_online_payload(db: Session, ble_id, phone_uuid, constants: dict):
     payload = ""
     query = text("""
     SELECT p.sig_duration, p.auto_unlock_db, p.totp_secret, p.seed
-    FROM peripheral p JOIN user_peripheral up ON p.ble_id = up.peripheral_ble_id  JOIN user u ON u.id = up.user_id
+    FROM peripheral p JOIN user_peripheral up ON p.ble_id = up.peripheral_ble_id  JOIN user u ON u.uuid = up.user_id
     WHERE p.ble_id = :ble_id
     AND u.phone_uuid = :phone_uuid
     AND (up.is_active = 1 AND p.is_active = 1
@@ -125,31 +144,21 @@ def get_online_payload(db: Session, ble_id, phone_uuid, constants: dict):
         raise Exception(f"Exception error: {str(e)}")
 
 def get_nearby_properties(db: Session, ble_id, phone_uuid, constants: dict):
+    print(f"Processing nearby properties for BLE ID: {ble_id}")
+    if ble_id == "88B79F70-61E0-4884-9A88-383AD7590BC6":
+        print(f"*** Processing nearby properties for MELANIE: {ble_id} ***")
     query = text(""" 
-    SELECT p.name, p.location, p.sig_duration, p.auto_unlock_db, p.totp_secret, p.seed, ph.uuid,
-    up.auto_unlock, up.offline_support, up.offline_support_from, up.offline_support_to, up.is_admin, u.is_super_admin
-    FROM user u 
-    LEFT JOIN user_peripheral up ON u.id = up.user_id
-    LEFT JOIN phone_peripheral pp ON u.phone_uuid = pp.phone_uuid AND up.peripheral_ble_id = pp.peripheral_ble_id
-    LEFT JOIN phone ph ON ph.uuid = u.phone_uuid
-    LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
-    WHERE u.phone_uuid = :phone_uuid
-    AND pp.peripheral_ble_id = :ble_id 
-    AND (up.is_active = 1 AND p.is_active = 1 
-        AND ((up.valid_from <= NOW() OR up.valid_from IS NULL) AND (NOW() <= up.valid_to OR up.valid_to IS NULL) 
-        OR up.is_admin = 1))
+    SELECT ph.name, ph.uuid
+    FROM phone ph 
+    WHERE ph.uuid = :ble_id
     """)
     try:
-        result = db.execute(query, {"phone_uuid": phone_uuid.upper(), "ble_id": ble_id}).mappings().fetchone()
+        result = db.execute(query, {"ble_id": ble_id}).mappings().fetchone()
         open_online_cmd = ""  # crypto_client.encrypt(open_online_cmd) This has been implemented as a separate request see "open_online"
         if result:
-            open_offline_cmd = get_offline_payload(result["offline_support"], result["offline_support_from"], result["offline_support_to"], result["uuid"], result["sig_duration"], result["seed"], result["totp_secret"], constants)
+            # open_offline_cmd = get_offline_payload(result["offline_support"], result["offline_support_from"], result["offline_support_to"], result["uuid"], result["sig_duration"], result["seed"], result["totp_secret"], constants)
             # Return response
-            response = ResponseBLE(phone_id=phone_uuid, ble_id=ble_id, name=result["name"], location=result["location"], auto_unlock_db=result["auto_unlock_db"],
-                  auto_unlock=result["auto_unlock"], offline_support=result["offline_support"],
-                  is_admin=result["is_admin"], is_super_admin=result["is_super_admin"],
-                  payload=open_online_cmd, payload_offline=open_offline_cmd, seed=result["seed"],
-                  totp_secret=result["totp_secret"], public_key="")
+            response = ResponseBLE(phone_id=phone_uuid, ble_id=ble_id, name=result["name"], location="", auto_unlock_db=-30, auto_unlock=False, offline_support=False, is_admin=False, is_super_admin=False, payload="", payload_offline="", seed="", totp_secret="", public_key="")
         else:
             # Return empty response if no data found
             response = ResponseBLE(phone_id=phone_uuid, ble_id=ble_id, name="", location="", auto_unlock_db=-30, auto_unlock=False, offline_support=False, is_admin=False, is_super_admin=False, payload="", payload_offline="", seed="", totp_secret="", public_key="")
@@ -162,6 +171,45 @@ def get_nearby_properties(db: Session, ble_id, phone_uuid, constants: dict):
         raise RuntimeError(f"Database error: {str(e)}")
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
+
+# def get_nearby_properties(db: Session, ble_id, phone_uuid, constants: dict):
+#     query = text("""
+#     SELECT p.name, p.location, p.sig_duration, p.auto_unlock_db, p.totp_secret, p.seed, ph.uuid,
+#     up.auto_unlock, up.offline_support, up.offline_support_from, up.offline_support_to, up.is_admin, u.is_super_admin
+#     FROM user u
+#     LEFT JOIN user_peripheral up ON u.uuid = up.user_id
+#     LEFT JOIN phone_peripheral pp ON u.phone_uuid = pp.phone_uuid AND up.peripheral_ble_id = pp.peripheral_ble_id
+#     LEFT JOIN phone ph ON ph.uuid = u.phone_uuid
+#     LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
+#     WHERE u.phone_uuid = :phone_uuid
+#     AND pp.peripheral_ble_id = :ble_id
+#     AND (up.is_active = 1 AND p.is_active = 1
+#         AND ((up.valid_from <= NOW() OR up.valid_from IS NULL) AND (NOW() <= up.valid_to OR up.valid_to IS NULL)
+#         OR up.is_admin = 1))
+#     """)
+#     try:
+#         result = db.execute(query, {"phone_uuid": phone_uuid.upper(), "ble_id": ble_id}).mappings().fetchone()
+#         open_online_cmd = ""  # crypto_client.encrypt(open_online_cmd) This has been implemented as a separate request see "open_online"
+#         if result:
+#             open_offline_cmd = get_offline_payload(result["offline_support"], result["offline_support_from"], result["offline_support_to"], result["uuid"], result["sig_duration"], result["seed"], result["totp_secret"], constants)
+#             # Return response
+#             response = ResponseBLE(phone_id=phone_uuid, ble_id=ble_id, name=result["name"], location=result["location"], auto_unlock_db=result["auto_unlock_db"],
+#                   auto_unlock=result["auto_unlock"], offline_support=result["offline_support"],
+#                   is_admin=result["is_admin"], is_super_admin=result["is_super_admin"],
+#                   payload=open_online_cmd, payload_offline=open_offline_cmd, seed=result["seed"],
+#                   totp_secret=result["totp_secret"], public_key="")
+#         else:
+#             # Return empty response if no data found
+#             response = ResponseBLE(phone_id=phone_uuid, ble_id=ble_id, name="", location="", auto_unlock_db=-30, auto_unlock=False, offline_support=False, is_admin=False, is_super_admin=False, payload="", payload_offline="", seed="", totp_secret="", public_key="")
+#
+#         return response
+#
+#     except ValueError as e:
+#         raise ValueError(f"Invalid date format: {e}")
+#     except SQLAlchemyError as e:
+#         raise RuntimeError(f"Database error: {str(e)}")
+#     except Exception as e:
+#         raise Exception(f"Exception error: {str(e)}")
 
 def safe_datetime(dt):
     if isinstance(dt, datetime):
@@ -234,7 +282,7 @@ def log_online_action(db: Session, ble_id, uuid, action_id, is_success, link_id 
             user_email_set = ""
         else:
             query = text("""
-            SELECT u.email FROM user u WHERE u.id = :user_id
+            SELECT u.email FROM user u WHERE u.uuid = :user_id
             """)
             user_email_set = db.execute(query, {"user_id": user_id}).mappings().fetchone()["email"]
         # Fetch action name
@@ -280,7 +328,7 @@ SELECT
     /* --- END OF MODIFIED LOGIC --- */
     p.is_active AS lock_is_active, p.last_temperature, ph.uuid AS phone_id, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.auto_unlock, p.seed, p.totp_secret, '' AS public_key, u.is_super_admin, u.location AS user_location, up.is_active
 FROM user u
-    LEFT JOIN user_peripheral up ON u.id = up.user_id
+    LEFT JOIN user_peripheral up ON u.uuid = up.user_id
     LEFT JOIN phone_peripheral pp ON u.phone_uuid = pp.phone_uuid AND up.peripheral_ble_id = pp.peripheral_ble_id
     LEFT JOIN phone ph ON ph.uuid = u.phone_uuid
     LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
@@ -305,7 +353,7 @@ SELECT
             EXISTS (
                 SELECT 1 
                 FROM peripheral_bell_user pbu 
-                WHERE pbu.peripheral_ble_id = p.ble_id 
+                    WHERE pbu.peripheral_ble_id = p.ble_id 
                 AND pbu.is_active = 1
             )
             -- Check if the Phone Peripheral link exists (already joined as 'pp')
@@ -316,7 +364,7 @@ SELECT
     /* --- END OF MODIFIED LOGIC --- */
     p.is_active AS lock_is_active, p.last_temperature, ph.uuid AS phone_id, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.auto_unlock, p.seed, p.totp_secret, '' AS public_key, u.is_super_admin, u.location AS user_location, up.is_active
 FROM user u
-    LEFT JOIN user_peripheral up ON u.id = up.user_id
+    LEFT JOIN user_peripheral up ON u.uuid = up.user_id
     LEFT JOIN phone_peripheral pp ON u.phone_uuid = pp.phone_uuid AND up.peripheral_ble_id = pp.peripheral_ble_id
     LEFT JOIN phone ph ON ph.uuid = u.phone_uuid
     LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
@@ -374,7 +422,7 @@ WHERE pbu.is_active = 1 AND pp.phone_uuid = :phone_uuid AND pbu.peripheral_ble_i
         else:
             query = text("""
             SELECT p.seed, p.totp_secret, p.name, p.sig_duration
-            FROM peripheral p JOIN user_peripheral up ON p.ble_id = up.peripheral_ble_id  JOIN user u ON u.id = up.user_id
+            FROM peripheral p JOIN user_peripheral up ON p.ble_id = up.peripheral_ble_id  JOIN user u ON u.uuid = up.user_id
             WHERE p.ble_id = :ble_id
             AND u.phone_uuid = :phone_uuid
             AND (up.is_active = 1 AND p.is_active = 1
@@ -459,6 +507,332 @@ def set_share_uses(db: Session, link_id):
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
+def create_peer(db: Session, peer_uuid: bytes, name: str, about_me: str = ""):
+    try:
+        insert_query = text("""
+        INSERT INTO user (uuid, name, about_me) VALUES (:uuid, :name, :about_me)
+        """)
+        # peer_uuid is the raw 16-byte value stored in the BINARY(16) `uuid` column.
+        db.execute(insert_query, {"uuid": peer_uuid, "name": name, "about_me": about_me})
+        db.commit()
+
+        # Convert the 16-byte value to a reversible ASCII (hex) string for the response.
+        return ResponseCreatePeer(success=True, uuid=peer_uuid.hex(), error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def update_peer(db: Session, peer_hex: str, name: str = None, about_me: str = None):
+    try:
+        # The ASCII hex string from the API maps back to the raw 16-byte `uuid` column.
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except ValueError:
+            raise Exception("Invalid peer uuid")
+        if len(peer_uuid) != 16:
+            raise Exception("Invalid peer uuid")
+
+        # Only update the columns that were actually supplied; leave the rest untouched.
+        fields = {}
+        if name is not None:
+            fields["name"] = name
+        if about_me is not None:
+            fields["about_me"] = about_me
+        if not fields:
+            raise Exception("No fields to update")
+
+        set_clause = ", ".join(f"{column} = :{column}" for column in fields)
+        update_query = text(f"""
+        UPDATE user SET {set_clause} WHERE uuid = :uuid AND is_active = 1
+        """)
+        result = db.execute(update_query, {**fields, "uuid": peer_uuid})
+        db.commit()
+        if result.rowcount == 0:
+            raise Exception("Peer not found")
+
+        # Return the current values so the caller reflects the stored row.
+        select_query = text("""
+        SELECT name, about_me FROM user WHERE uuid = :uuid AND is_active = 1
+        """)
+        row = db.execute(select_query, {"uuid": peer_uuid}).mappings().fetchone()
+
+        return ResponsePeer(
+            success=True,
+            uuid=peer_hex,
+            name=row["name"] or "",
+            about_me=row["about_me"] or "",
+            error="",
+        )
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def get_peer(db: Session, peer_hex: str):
+    try:
+        # The ASCII hex string from the API maps back to the raw 16-byte `uuid` column.
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except ValueError:
+            raise Exception("Invalid peer uuid")
+        if len(peer_uuid) != 16:
+            raise Exception("Invalid peer uuid")
+
+        select_query = text("""
+        SELECT name, about_me FROM user WHERE uuid = :uuid AND is_active = 1
+        """)
+        row = db.execute(select_query, {"uuid": peer_uuid}).mappings().fetchone()
+        if not row:
+            raise Exception("Peer not found")
+
+        return ResponsePeer(
+            success=True,
+            uuid=peer_hex,
+            name=row["name"] or "",
+            about_me=row["about_me"] or "",
+            error="",
+        )
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def register_peer_token(db: Session, peer_hex: str, token: str):
+    """Stores a peer's FCM push token (in the user table's fcm_token column), so the relay can
+    wake/ring the peer with an INCOMING_CHAT push when its app is backgrounded. X-API-Key only —
+    peers have no OAuth session, so this is keyed by uuid hex like create_peer / get_peer."""
+    try:
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except ValueError:
+            raise Exception("Invalid peer uuid")
+        if len(peer_uuid) != 16:
+            raise Exception("Invalid peer uuid")
+
+        update_query = text("""
+        UPDATE user SET fcm_token = :token WHERE uuid = :uuid AND is_active = 1
+        """)
+        result = db.execute(update_query, {"token": token, "uuid": peer_uuid})
+        db.commit()
+        if result.rowcount == 0:
+            raise Exception("Peer not found")
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def get_peer_push_info(db: Session, peer_hex: str):
+    """Returns (fcm_token, name) for a peer by hex uuid; (None, "") when unknown/invalid."""
+    try:
+        peer_uuid = bytes.fromhex(peer_hex)
+    except ValueError:
+        return (None, "")
+    if len(peer_uuid) != 16:
+        return (None, "")
+    row = db.execute(
+        text("SELECT fcm_token, name FROM user WHERE uuid = :uuid AND is_active = 1"),
+        {"uuid": peer_uuid},
+    ).mappings().fetchone()
+    if not row:
+        return (None, "")
+    return (row["fcm_token"], row["name"] or "")
+
+def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str) -> bool:
+    """Pushes a signaling event (chat or friend handshake) to a backgrounded/killed peer via the
+    PEERS.CLUB Firebase app, as a time-sensitive alert (breaks through Focus / Do Not Disturb).
+    `msg_type` is the WS signal type; the iOS-facing action is INCOMING_CHAT for a chat request and
+    the same FRIEND_* string otherwise. Returns False (no raise) if not configured / on error."""
+    if app_peers is None:
+        print("send_signal_push: PEERS.CLUB Firebase app not configured — push skipped.")
+        return False
+    if not target_token:
+        return False
+    name = sender_name or "A peer"
+    copy = {
+        "CHAT_REQUEST":   ("Incoming chat",     f"{name} wants to chat"),
+        "FRIEND_REQUEST": ("Friend Request",    f"{name} wants to be friends"),
+        "FRIEND_ACCEPT":  ("New friend",        f"You're friends now with {name}"),
+        "NOFRIEND":       ("Friend request",    f"{name} declined your friend request"),
+        "UNFRIEND":       ("Friendship ended",  f"{name} ended the friendship"),
+    }
+    title, body = copy.get(msg_type, ("PEERS.CLUB", "New activity"))
+    # iOS routes chat via the INCOMING_CHAT action; friend actions match the WS type verbatim.
+    fcm_action = "INCOMING_CHAT" if msg_type == "CHAT_REQUEST" else msg_type
+    try:
+        message = messaging.Message(
+            token=target_token,
+            notification=messaging.Notification(title=title, body=body),
+            data={"action": fcm_action, "sender_id": sender_hex, "sender_name": name},
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "10"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(
+                        sound="default",
+                        content_available=True,
+                        custom_data={"interruption-level": "time-sensitive"},
+                    ),
+                ),
+            ),
+        )
+        response = messaging.send(message, app=app_peers)
+        print(f"send_signal_push: {msg_type} from {sender_hex[:8]} → {response}")
+        return True
+    except Exception as e:
+        print(f"send_signal_push error: {e}")
+        return False
+
+def send_chat_push(target_token: str, sender_hex: str, sender_name: str) -> bool:
+    """Backward-compatible wrapper — a chat request push."""
+    return send_signal_push(target_token, "CHAT_REQUEST", sender_hex, sender_name)
+
+def add_friend(db: Session, user_hex: str, friend_hex: str):
+    """Inserts a friend link (user_hex -> friend_hex) into user_user. X-API-Key only; idempotent
+    (adding an existing friend succeeds without a duplicate row).
+
+    NOTE: column names assumed to be (user_id, friend_id) holding the BINARY(16) uuids, matching
+    the user_peripheral.user_id convention. Adjust the two SQL statements if user_user differs."""
+    try:
+        try:
+            user_uuid = bytes.fromhex(user_hex)
+            friend_uuid = bytes.fromhex(friend_hex)
+        except ValueError:
+            raise Exception("Invalid uuid")
+        if len(user_uuid) != 16 or len(friend_uuid) != 16:
+            raise Exception("Invalid uuid")
+        if user_uuid == friend_uuid:
+            raise Exception("Cannot add yourself as a friend")
+
+        existing = db.execute(
+            text("SELECT 1 FROM user_user WHERE uuid_1 = :u AND uuid_2 = :f"),
+            {"u": user_uuid, "f": friend_uuid},
+        ).fetchone()
+        if not existing:
+            db.execute(
+                text("INSERT INTO user_user (uuid_1, uuid_2) VALUES (:u, :f)"),
+                {"u": user_uuid, "f": friend_uuid},
+            )
+            db.commit()
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def cancel_friend(db: Session, user_hex: str, friend_hex: str):
+    """Ends a friendship: removes the user_user link in BOTH directions (the row may have been
+    created by either side via add_friend). X-API-Key only; idempotent.
+
+    NOTE: same (user_id, friend_id) column assumption as add_friend — confirm against user_user."""
+    try:
+        try:
+            user_uuid = bytes.fromhex(user_hex)
+            friend_uuid = bytes.fromhex(friend_hex)
+        except ValueError:
+            raise Exception("Invalid uuid")
+        if len(user_uuid) != 16 or len(friend_uuid) != 16:
+            raise Exception("Invalid uuid")
+
+        db.execute(
+            text("""
+            DELETE FROM user_user
+        WHERE (uuid_1 = :u AND uuid_2 = :f) OR (uuid_1 = :f AND uuid_2 = :u)
+            """),
+            {"u": user_uuid, "f": friend_uuid},
+        )
+        db.commit()
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def get_friends(db: Session, user_hex: str):
+    """Returns the user's friends — both directions of the user_user link (whoever called
+    add_friend created a single A→B row) — as dicts {uuid (hex), name, about_me}. Images are
+    attached by the endpoint. UNION de-duplicates if a reciprocal link ever exists."""
+    try:
+        user_uuid = bytes.fromhex(user_hex)
+    except (ValueError, TypeError):
+        raise Exception("Invalid uuid")
+    if len(user_uuid) != 16:
+        raise Exception("Invalid uuid")
+
+    rows = db.execute(
+        text("""
+        SELECT u.uuid AS fuid, u.name AS name, u.about_me AS about_me
+        FROM user_user uu JOIN user u ON u.uuid = uu.uuid_2
+        WHERE uu.uuid_1 = :me
+        UNION
+        SELECT u.uuid AS fuid, u.name AS name, u.about_me AS about_me
+        FROM user_user uu JOIN user u ON u.uuid = uu.uuid_1
+        WHERE uu.uuid_2 = :me
+        """),
+        {"me": user_uuid},
+    ).mappings().fetchall()
+
+    return [
+        {"uuid": r["fuid"].hex(), "name": r["name"] or "", "about_me": r["about_me"] or ""}
+        for r in rows
+    ]
+
+def filter_active_peers(db: Session, peer_hexes):
+    """Given a list of hex uuids, returns those whose user row has is_active = 1 (i.e. the peer
+    hasn't set themselves inactive). Inactive peers are dropped so they disappear from other phones'
+    nearby lists. The input list is small (a caller's BLE-nearby group), so a per-id lookup is fine."""
+    active = []
+    for peer_hex in peer_hexes:
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except (ValueError, TypeError):
+            continue
+        if len(peer_uuid) != 16:
+            continue
+        row = db.execute(
+            text("SELECT is_active FROM user WHERE uuid = :uuid"),
+            {"uuid": peer_uuid},
+        ).mappings().fetchone()
+        if row and row["is_active"]:
+            active.append(peer_hex)
+    return active
+
+def activate_user(db: Session, user_hex: str, is_active: bool):
+    """Sets a peer's is_active flag. X-API-Key only. Deliberately does NOT filter on is_active in
+    the WHERE clause so an already-inactive user can re-activate themselves.
+
+    NOTE: is_active is also used across the codebase as a 'valid record' filter (get_peer /
+    update_peer etc. select `... AND is_active = 1`), so setting a user inactive also hides them
+    from peer lookups — intended for 'not discoverable', but it likewise blocks their own profile
+    reads/updates until active again. Switch to a dedicated column if presence must be independent."""
+    try:
+        try:
+            user_uuid = bytes.fromhex(user_hex)
+        except ValueError:
+            raise Exception("Invalid uuid")
+        if len(user_uuid) != 16:
+            raise Exception("Invalid uuid")
+
+        result = db.execute(
+            text("UPDATE user SET is_active = :active WHERE uuid = :uuid"),
+            {"active": 1 if is_active else 0, "uuid": user_uuid},
+        )
+        db.commit()
+        if result.rowcount == 0:
+            raise Exception("Peer not found")
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
 def set_2fatoken(db: Session, username, password):
     try:
         user = login(db, username, password)
@@ -467,7 +841,7 @@ def set_2fatoken(db: Session, username, password):
         hashed_two_fa_token = crypt_module.hash_password(two_fa_token)
         # Save the token in the database (or in-memory store like Redis)
         update_query = text("""
-        UPDATE user SET 2fa_token = :2fa_token WHERE id = :id
+        UPDATE user SET 2fa_token = :2fa_token WHERE uuid = :id
         """)
         db.execute(update_query,{"2fa_token": hashed_two_fa_token, "id": user["id"]})
         db.commit()
@@ -487,7 +861,7 @@ def set_2fatoken(db: Session, username, password):
 
 def login_no2fa(db: Session, username, password):
     query = text("""
-    SELECT id, email, password FROM user u WHERE u.email = :username AND u.is_active = 1
+    SELECT uuid, email, password FROM user u WHERE u.email = :username AND u.is_active = 1
     """)
     try:
         login(db, username, password)
@@ -500,7 +874,7 @@ def login_no2fa(db: Session, username, password):
 
 def login(db: Session, username, password):
     query = text("""
-    SELECT id, email, password FROM user u WHERE u.email = :username AND u.is_active = 1
+    SELECT uuid, email, password FROM user u WHERE u.email = :username AND u.is_active = 1
     """)
     try:
         # Query user by email (username in OAuth2PasswordRequestForm is the email)
@@ -519,7 +893,7 @@ def login(db: Session, username, password):
 
 def verify_2fatoken(db: Session, username, token, phone_uuid, constants: dict):
     query = text("""
-    SELECT id, email, 2fa_token, is_super_admin FROM user WHERE email = :username
+    SELECT uuid, email, 2fa_token, is_super_admin FROM user WHERE email = :username
     """)
     try:
         user = db.execute(query, {"username": username}).mappings().fetchone()
@@ -529,7 +903,7 @@ def verify_2fatoken(db: Session, username, token, phone_uuid, constants: dict):
             hashed_two_fa_token = crypt_module.hash_password(token)
             # Save the token in the database
             update_query = text("""
-            UPDATE user SET 2fa_token = :2fa_token WHERE id = :id
+            UPDATE user SET 2fa_token = :2fa_token WHERE uuid = :id
             """)
             db.execute(update_query, {"2fa_token": hashed_two_fa_token, "id": user["id"]})
             db.commit()
@@ -606,7 +980,7 @@ def check_oauth_credentials(db: Session, token: str, constants: dict):
             raise Exception("Invalid decode token")
 
         query = text("""
-        SELECT u.id FROM user u WHERE u.email = :email AND u.is_active = 1
+        SELECT u.uuid FROM user u WHERE u.email = :email AND u.is_active = 1
         """)
         user = db.execute(query, {"email": email}).mappings().fetchone()
         if user is None:
@@ -640,7 +1014,7 @@ def generate_password(length=12):
 
 def set_password(db: Session, username):
     query = text("""
-    SELECT id, email, first_name, last_name FROM user WHERE email = :username
+    SELECT uuid, email, name, about_me FROM user WHERE email = :username
     """)
     try:
         user = db.execute(query, {"username": username}).mappings().fetchone()
@@ -654,7 +1028,7 @@ def set_password(db: Session, username):
 
         # Save the password in the database (or in-memory store like Redis)
         update_query = text("""
-        UPDATE user SET password = :password WHERE id = :id
+        UPDATE user SET password = :password WHERE uuid = :id
         """)
         db.execute(update_query, {"password": hashed_password, "id": user["id"]})
         db.commit()
@@ -689,7 +1063,7 @@ def split_name(full_name):
 
 def check_user_exists(db: Session, email):
     query = text("""
-    SELECT id, phone_uuid, first_name, last_name FROM user WHERE email = :email
+    SELECT uuid, phone_uuid, name, uuid FROM user WHERE email = :email
     """)
     try:
         user = db.execute(query, {"email": email}).mappings().fetchone()
@@ -829,7 +1203,7 @@ def init_user_peripherals(db, phone_uuid: str, user_id: int):
 
 def update_user(db: Session, id: int, email: str, first_name: str, last_name: str, location: str, super_admin_support: bool = False):
     update_query = text("""
-    UPDATE user SET email = :email, first_name = :first_name, last_name = :last_name, location = :location, is_super_admin = :super_admin_support WHERE id = :id
+    UPDATE user SET email = :email, name = :first_name, about_me = :last_name, location = :location, is_super_admin = :super_admin_support WHERE uuid = :id
     """)
     try:
         db.execute(update_query, {"email": email, "first_name": first_name, "last_name": last_name, "location": location, "super_admin_support": super_admin_support, "id": id})
@@ -854,7 +1228,7 @@ def add_user(db: Session, email: str, first_name: str, last_name: str, location:
         password = generate_password(length=12)
         hashed_password = crypt_module.hash_password(password)
         insert_query = text("""
-        INSERT INTO user (email, phone_uuid, password, first_name, last_name, location, is_super_admin) VALUES (:email, :phone_uuid, :password, :first_name, :last_name, :location, :super_admin_support)
+        INSERT INTO user (email, phone_uuid, password, name, uuid, location, is_super_admin) VALUES (:email, :phone_uuid, :password, :first_name, :last_name, :location, :super_admin_support)
         """)
         db.execute(insert_query,
                    {"email": email, "phone_uuid": phone_uuid, "password": hashed_password, "first_name": first_name,
@@ -862,7 +1236,7 @@ def add_user(db: Session, email: str, first_name: str, last_name: str, location:
         db.commit()
         # Get new user id, (later coding) should come from insert query
         query = text("""
-        SELECT id, phone_uuid, first_name, last_name FROM user WHERE email = :email
+        SELECT uuid, phone_uuid, name, uuid FROM user WHERE email = :email
         """)
         user = db.execute(query, {"email": email}).mappings().fetchone()
 
@@ -906,7 +1280,7 @@ def set_user_lock(db: Session, user_id: int, from_email: str, ble_id: str, const
             query = text("""
             SELECT up.id, up.is_admin, up.num_keys, u.is_super_admin
             FROM user u
-            JOIN user_peripheral up on up.user_id = u.id
+            JOIN user_peripheral up on up.user_id = u.uuid
             WHERE up.peripheral_ble_id = :ble_id AND u.email = :from_email
             """)
             from_user_num_keys = db.execute(query, {"ble_id": ble_id, "from_email": from_email}).mappings().fetchone()
@@ -982,7 +1356,7 @@ def set_peripheral(db: Session, ble_id: str, name: str, location: str, sig_durat
             update_peripheral(db, ble_id, name, location, sig_duration, auto_unlock_db, remote_support, is_active)
 
         query = text("""
-        SELECT id, phone_uuid FROM user
+        SELECT uuid, phone_uuid FROM user
         """)
         users = db.execute(query).mappings().fetchall()
         for user in users:
@@ -1067,9 +1441,9 @@ def delete_peripheral(db: Session, ble_id: str):
 
 def get_peripheral(db: Session, user_id: int, ble_id: str):
     query = text("""
-    SELECT u.id, u.email, u.first_name, u.last_name, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.auto_unlock_db, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
+    SELECT u.uuid, u.email, u.name, u.about_me, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.auto_unlock_db, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
     FROM user_peripheral up
-    LEFT JOIN user u ON u.id = up.user_id
+    LEFT JOIN user u ON u.uuid = up.user_id
     LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
     WHERE up.user_id = :user_id ANd up.peripheral_ble_id = :ble_id
     """)
@@ -1087,21 +1461,21 @@ def get_users(db: Session, user_id: int = -1):
         # Fetch all
         if user_id == -1:
             query = text("""
-            SELECT u.id, u.email, u.first_name, u.last_name, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.remote_support AS peripheral_remote_support, p.is_active AS peripheral_is_active, up.auto_unlock, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
+            SELECT u.uuid, u.email, u.name, u.about_me, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.remote_support AS peripheral_remote_support, p.is_active AS peripheral_is_active, up.auto_unlock, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
             FROM user u
-            LEFT JOIN user_peripheral up ON u.id = up.user_id
+            LEFT JOIN user_peripheral up ON u.uuid = up.user_id
             LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
-            ORDER BY u.last_name, u.first_name, u.id, p.name
+            ORDER BY u.name, u.about_me, u.uuid, p.name
             """)
             return db.execute(query).mappings().fetchall()
         else:
             query = text("""
-            SELECT u.id, u.email, u.first_name, u.last_name, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.remote_support AS peripheral_remote_support, p.is_active AS peripheral_is_active, up.auto_unlock, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
+            SELECT u.uuid, u.email, u.name, u.about_me, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.remote_support AS peripheral_remote_support, p.is_active AS peripheral_is_active, up.auto_unlock, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
             FROM user_peripheral up
-            LEFT JOIN user u ON u.id = up.user_id
+            LEFT JOIN user u ON u.uuid = up.user_id
             LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
             WHERE up.user_id = :user_id
-            ORDER BY u.last_name, u.first_name, u.id, p.name
+            ORDER BY u.name, u.about_me, u.uuid, p.name
             """)
             return db.execute(query, {"user_id": user_id}).mappings().fetchall()
 
@@ -1115,7 +1489,7 @@ def get_phone_peripherals(db: Session, phone_uuid, constants: dict):
     SELECT p.ble_id, p.name, p.location, p.sig_duration, p.auto_unlock_db, p.totp_secret, p.seed, ph.uuid,
     up.auto_unlock, IF((NOW() >= offline_support_from OR offline_support_from IS NULL) AND (NOW() <= offline_support_to OR offline_support_to IS NULL), 1, 0) AS offline_support, up.offline_support_from, up.offline_support_to, up.is_admin, u.is_super_admin
     FROM user u 
-    LEFT JOIN user_peripheral up ON u.id = up.user_id
+    LEFT JOIN user_peripheral up ON u.uuid = up.user_id
     LEFT JOIN phone_peripheral pp ON u.phone_uuid = pp.phone_uuid AND up.peripheral_ble_id = pp.peripheral_ble_id
     LEFT JOIN phone ph ON ph.uuid = u.phone_uuid
     LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
@@ -1158,29 +1532,15 @@ def get_phone_peripherals(db: Session, phone_uuid, constants: dict):
 
 def get_user(db: Session, user_id: int):
     query = text("""
-    SELECT u.id, u.email, u.first_name, u.last_name, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.remote_support AS peripheral_remote_support, p.is_active AS peripheral_is_active, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
+    SELECT u.uuid, u.email, u.name, u.about_me, u.location, u.is_active, u.is_super_admin, p.ble_id, p.name AS peripheral_name, p.location AS peripheral_location, p.remote_support AS peripheral_remote_support, p.is_active AS peripheral_is_active, up.is_admin, up.num_keys, up.remote_support, up.offline_support, IFNULL(DATE_FORMAT(up.valid_from, '%Y-%m-%d %H:%i:%s'),'') AS valid_from, IFNULL(DATE_FORMAT(up.valid_to, '%Y-%m-%d %H:%i:%s'),'') AS valid_to, up.is_active AS up_active
     FROM user_peripheral up
-    LEFT JOIN user u ON u.id = up.user_id
+    LEFT JOIN user u ON u.uuid = up.user_id
     LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
     WHERE up.user_id = :user_id
     """)
     try:
         # Fetch one
         return db.execute(query, {"user_id": user_id}).mappings().fetchone()
-
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"Database error: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Exception error: {str(e)}")
-
-def activate_user(db: Session, user_id: int, is_active: bool):
-    update_query = text("""
-    UPDATE user SET is_active = :is_active WHERE id = :user_id
-    """)
-    try:
-        db.execute(update_query,{"is_active": is_active, "user_id": user_id})
-        db.commit()
-        return ResponseResult(success=True, error="")
 
     except SQLAlchemyError as e:
         raise RuntimeError(f"Database error: {str(e)}")
@@ -1203,7 +1563,7 @@ def activate_user_lock(db: Session, user_id: int, ble_id: str, is_active: bool):
 
 def delete_user(db: Session, user_id: int):
     query = text("""
-     SELECT phone_uuid FROM user WHERE id = :user_id
+     SELECT phone_uuid FROM user WHERE uuid = :user_id
      """)
     try:
         phone_uuid = db.execute(query, {"user_id": user_id}).mappings().fetchone()["phone_uuid"]
@@ -1229,7 +1589,7 @@ def delete_phone(db: Session, phone_uuid: str):
 
 def check_is_super_admin(db: Session, email: str) -> bool:
     query = text("""
-     SELECT id FROM user WHERE email = :email AND is_active = 1 AND is_super_admin = 1
+     SELECT uuid FROM user WHERE email = :email AND is_active = 1 AND is_super_admin = 1
      """)
     try:
         return db.execute(query, {"email": email}).mappings().fetchone() is not None
@@ -1241,7 +1601,7 @@ def check_is_super_admin(db: Session, email: str) -> bool:
 
 def login_panel(db: Session, username, password, phone_uuid, constants: dict):
     query = text("""
-    SELECT id, email, password, phone_uuid FROM user u WHERE u.email = :username AND u.is_active = 1
+    SELECT uuid, email, password, phone_uuid FROM user u WHERE u.email = :username AND u.is_active = 1
     """)
 
     try:
@@ -1292,7 +1652,7 @@ def get_bell_panel(db: Session, user_id):
     FROM bell b 
     JOIN bell_panel bp ON b.bell_panel_id = bp.id
     JOIN user u ON u.bell_panel_id = bp.id
-    WHERE u.id = :user_id 
+    WHERE u.uuid = :user_id 
     """)
     try:
         return db.execute(query, {"user_id": user_id}).mappings().fetchall()
@@ -1314,7 +1674,7 @@ def get_bell_panel(db: Session, user_id):
 
 def get_user_id (db: Session, email: str) -> bool:
     query = text("""
-     SELECT id, bell_panel_id FROM user WHERE email = :email AND is_active = 1 AND bell_panel_id IS NOT NULL AND bell_panel_id > 0;
+     SELECT uuid, bell_panel_id FROM user WHERE email = :email AND is_active = 1 AND bell_panel_id IS NOT NULL AND bell_panel_id > 0;
      """)
     try:
         return db.execute(query, {"email": email}).mappings().fetchone()
@@ -1326,7 +1686,7 @@ def get_user_id (db: Session, email: str) -> bool:
 
 def check_is_bell_panel(db: Session, email: str) -> bool:
     query = text("""
-     SELECT id, bell_panel_id FROM user WHERE email = :email AND is_active = 1 AND bell_panel_id IS NOT NULL AND bell_panel_id > 0;
+     SELECT uuid, bell_panel_id FROM user WHERE email = :email AND is_active = 1 AND bell_panel_id IS NOT NULL AND bell_panel_id > 0;
      """)
     try:
         return db.execute(query, {"email": email}).mappings().fetchone()
@@ -1338,7 +1698,7 @@ def check_is_bell_panel(db: Session, email: str) -> bool:
 
 def store_fcm_token(db: Session, user_id: int, token: str):
     update_query = text("""
-    UPDATE user SET fcm_token = :token WHERE id = :user_id
+    UPDATE user SET fcm_token = :token WHERE uuid = :user_id
     """)
     try:
         db.execute(update_query,{"token": token, "user_id": user_id})
@@ -1351,8 +1711,10 @@ def store_fcm_token(db: Session, user_id: int, token: str):
 
 # Sends a silent data-only message to an Android device to trigger the openDoor method
 def open_bellxs_lock(db: Session, ble_id: str, email: str):
+    if app_bellxs is None:   # BellXS Firebase not configured (peers-only deployment)
+        return False
     query = text("""
-    SELECT u.fcm_token, bp.peripheral_ble_id 
+    SELECT u.fcm_token, bp.peripheral_ble_id
     FROM user u 
     JOIN bell_panel bp ON bp.id = u.bell_panel_id 
     WHERE bp.peripheral_ble_id = :ble_id AND bp.is_active = 1
@@ -1389,10 +1751,12 @@ def open_bellxs_lock(db: Session, ble_id: str, email: str):
 
 # Sends a silent data-only message to an Android device to trigger the openDoor method
 def notify_safexs_doorbell(db: Session, bell_id: int, image_filename: str = ""):
+    if app_safexs is None:   # SafeXS Firebase not configured (peers-only deployment)
+        return None
     query = text("""
                  SELECT pbu.peripheral_ble_id, u.fcm_token, u.email, p.name
                  FROM peripheral_bell_user pbu
-                          JOIN user u ON u.id = pbu.user_id
+                          JOIN user u ON u.uuid = pbu.user_id
                           JOIN peripheral p ON p.ble_id = pbu.peripheral_ble_id
                  WHERE pbu.bell_id = :bell_id
                    AND pbu.is_active = 1
@@ -1480,10 +1844,12 @@ def stop_safexs_doorbell_ring(db: Session, bell_id: int, accepted_by_email: str 
     Call this function when a user Answers or Opens the door.
     It sends a STOP command to everyone else to silence their phones.
     """
+    if app_safexs is None:   # SafeXS Firebase not configured (peers-only deployment)
+        return None
     query = text("""
 SELECT u.fcm_token, u.email
 FROM peripheral_bell_user pbu
-JOIN user u ON u.id = pbu.user_id
+JOIN user u ON u.uuid = pbu.user_id
 WHERE pbu.bell_id = :bell_id
 AND pbu.is_active = 1
      """)

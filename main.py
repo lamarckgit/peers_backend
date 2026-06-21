@@ -4,6 +4,7 @@ import os
 import ssl
 import threading
 import time
+import uuid
 
 import fastapi
 
@@ -28,24 +29,72 @@ from typing import Dict, List, Optional
 # 1. Create global instances
 license_manager = LicenseManager()
 license_manager.ensure_constants()    # Make sure constants are loaded!
-database = Database(license_manager.constants["DATABASE_URL"])
+# Each customer instance has its OWN database (DATABASE_URL comes from the
+# license-issued constants and may point at its own MariaDB host). A modest
+# per-instance pool is a sane default for a single-worker app; bump it per
+# instance via env if one customer needs more. Only when several instances
+# share one MariaDB host do these add up against that host's max_connections.
+database = Database(
+    license_manager.constants["DATABASE_URL"],
+    pool_size=int(os.environ.get("DB_POOL_SIZE", "5")),
+    max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "5")),
+)
 license_manager_thread = None
-# Ensure the directory exists
+snapshot_cleanup_thread = None
+# Ensure the directories exists
+PROFILE_DIR = "static/profile_images"
+os.makedirs(PROFILE_DIR, exist_ok=True)
 SNAPSHOT_DIR = "static/snapshots"
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+# Doorbell snapshots are never deleted by the request path; clean them up
+# in-process so a customer deployment is self-contained (no external cron/timer).
+SNAPSHOT_RETENTION_DAYS = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "14"))
+SNAPSHOT_CLEANUP_INTERVAL_S = int(os.environ.get("SNAPSHOT_CLEANUP_INTERVAL_S", str(24 * 3600)))
 
-# 2. Background thread runner
+# 2. Background thread runners
 def run_license_manager():
     license_manager.daily_renewal_loop()
+
+def cleanup_snapshots_once():
+    """Delete this instance's snap_*.jpg older than SNAPSHOT_RETENTION_DAYS."""
+    cutoff = time.time() - SNAPSHOT_RETENTION_DAYS * 86400
+    removed = 0
+    try:
+        with os.scandir(SNAPSHOT_DIR) as entries:
+            for entry in entries:
+                if not (entry.is_file() and entry.name.startswith("snap_") and entry.name.endswith(".jpg")):
+                    continue
+                try:
+                    if entry.stat().st_mtime < cutoff:
+                        os.remove(entry.path)
+                        removed += 1
+                except OSError:
+                    continue  # file vanished or unreadable; skip
+    except FileNotFoundError:
+        return
+    if removed:
+        logging.info(f"Snapshot cleanup: removed {removed} files older than {SNAPSHOT_RETENTION_DAYS}d")
+
+def run_snapshot_cleanup():
+    while True:
+        try:
+            cleanup_snapshots_once()
+        except Exception as e:
+            logging.error(f"Snapshot cleanup error: {e}")
+        time.sleep(SNAPSHOT_CLEANUP_INTERVAL_S)
 
 # 3. Lifespan context
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global license_manager_thread
+    global license_manager_thread, snapshot_cleanup_thread
     if not license_manager_thread or not license_manager_thread.is_alive():
         license_manager_thread = threading.Thread(target=run_license_manager, daemon=True)
         license_manager_thread.start()
         logging.info("Started LicenseManager renewal thread.")
+    if not snapshot_cleanup_thread or not snapshot_cleanup_thread.is_alive():
+        snapshot_cleanup_thread = threading.Thread(target=run_snapshot_cleanup, daemon=True)
+        snapshot_cleanup_thread.start()
+        logging.info("Started snapshot cleanup thread.")
     yield
     # Optionally add cleanup logic here if needed
     if hasattr(license_manager, "db") and license_manager.db is not None:
@@ -131,10 +180,46 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             target_id = data.get("target")
 
             if target_id:
-                # Forward the exact message to the target peer
-                # We add the 'sender' ID so the target knows who replied
+                # Forward the exact message to the target peer (stamping the sender so the
+                # recipient knows who it's from).
                 data["sender"] = client_id
-                await manager.send_personal_message(data, target_id)
+                msg_type = data.get("type")
+                print(f"relay {client_id} → {target_id}: {msg_type}")
+
+                # Try a live delivery first. A killed app may leave a stale socket in
+                # active_connections (its disconnect not yet detected); sending into it raises,
+                # so we drop it and fall through to the FCM push instead of silently losing the
+                # request.
+                delivered = False
+                ws = manager.active_connections.get(target_id)
+                if ws is not None:
+                    try:
+                        await ws.send_json(data)
+                        delivered = True
+                    except Exception as e:
+                        print(f"relay: send to {target_id[:8]} failed ({e}); dropping stale socket")
+                        manager.disconnect(target_id)
+
+                if not delivered:
+                    # Signal types that warrant a push when the target is offline
+                    # (backgrounded/killed): chat request + the friend handshake.
+                    if msg_type in ("CHAT_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND"):
+                        try:
+                            s = database.create_session()
+                            try:
+                                token, _ = response_module.get_peer_push_info(s, target_id)
+                                _, sender_name = response_module.get_peer_push_info(s, client_id)
+                                if token:
+                                    ok = response_module.send_signal_push(token, msg_type, client_id, sender_name)
+                                    print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={ok}")
+                                else:
+                                    print(f"relay: offline target {target_id[:8]} has no push token")
+                            finally:
+                                s.close()
+                        except Exception as e:
+                            print(f"relay FCM fallback error: {e}")
+                    else:
+                        print(f"relay: target {target_id[:8]} offline; dropping {msg_type}")
 
     except WebSocketDisconnect:
         manager.disconnect(client_id)
@@ -146,6 +231,64 @@ ssl_context.load_cert_chain("fullchain.pem", keyfile="privkey.pem")
 # Use FastAPI's APIKeyHeader dependency to fetch a secret key from headers
 api_key_header = APIKeyHeader(name="x-api-key")
 
+
+@app.get("/health")
+async def health():
+    """Per-customer liveness + license-renewal health for monitoring.
+
+    Returns 200 when constants are loaded and the last daily renewal
+    succeeded, 503 otherwise — so an uptime monitor flips on a stuck
+    renewal (which would otherwise silently expire the license next day).
+    Deliberately exposes no secrets (no UUID/DB/keys)."""
+    constants = license_manager.constants or {}
+    healthy = bool(constants) and license_manager.last_renewal_error is None
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status": "ok" if healthy else "degraded",
+            "last_renewal_date": license_manager.last_renewal_date,
+            "last_renewal_error": license_manager.last_renewal_error,
+            "license_expiry_date": constants.get("LICENSE_EXPIRY_DATE"),
+        },
+    )
+
+class RequestUuid(BaseModel):
+    uuid: str
+
+class RequestCreatePeer(BaseModel):
+    name: str
+    about_me: Optional[str] = None
+    image_data: Optional[str] = None
+
+class RequestUpdatePeer(BaseModel):
+    uuid: str
+    name: Optional[str] = None
+    about_me: Optional[str] = None
+    image_data: Optional[str] = None
+
+class RequestUpdatePeerImage(BaseModel):
+    uuid: str
+    image_data: str
+
+class RequestUpdatePeerName(BaseModel):
+    uuid: str
+    name: str
+
+class RequestUpdatePeerAboutMe(BaseModel):
+    uuid: str
+    about_me: str
+
+class RequestPeersOnline(BaseModel):
+    uuids: List[str]
+
+class RequestAddFriend(BaseModel):
+    uuid: str
+    friend_uuid: str
+
+class RequestActivateUser(BaseModel):
+    uuid: str
+    is_active: bool
+
 class RequestAddUser(BaseModel):
     uuid: str
     email: str
@@ -156,7 +299,6 @@ class RequestAddUser(BaseModel):
 
 class RequestActivateUser(BaseModel):
     uuid: str
-    id: int
     is_active: bool
 
 class RequestActivateUserLock(BaseModel):
@@ -498,6 +640,285 @@ async def get_all_locks(params: RequestRemote, username: response_module.Respons
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+@app.post("/v1/create_peer/", response_model=response_module.ResponseCreatePeer, dependencies=[Depends(verify_api_key)])
+async def create_peer(params: RequestCreatePeer, db: Session = Depends(get_db)):
+    message = ""
+    result = False
+    peer_hex = ""
+    try:
+        peer = uuid.uuid4()
+        peer_bytes = peer.bytes      # 16-byte value stored in the DB
+        peer_hex = peer.hex          # 32-char ASCII representation (filename + response)
+        if params.image_data:
+            try:
+                # 1. Create the specific filename requested
+                # peer_{uuid_hex}.jpg
+                filename = f"peer_{peer_hex}.jpg"
+                file_path = os.path.join(PROFILE_DIR, filename)
+
+                # 2. Decode and Save locally
+                img_bytes = base64.b64decode(params.image_data)
+                with open(file_path, "wb") as f:
+                    f.write(img_bytes)
+
+                # 3. Store the filename to send in notification
+                image_filename = filename
+                message = image_filename
+
+            except Exception as img_err:
+                message = f"Image save failed: {img_err}"
+                image_filename = ""
+
+        response = response_module.create_peer(db, peer_bytes, params.name, params.about_me)
+        result = True
+        return response
+
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        message = message.replace("Exception error: ", "")
+        # No peripheral involved in peer creation; log against the new peer's hex uuid.
+        response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
+
+# Registers a peer's FCM push token (so it can be woken/rung for an incoming chat while its app
+# is backgrounded). X-API-Key only — peers have no OAuth session — keyed by uuid hex in the body
+# ({"uuid": ..., "fcm_token": ...}), reusing the iOS postRequestForJson helper like create_peer.
+@app.post("/v1/register_peer_token/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+async def register_peer_token(params: RequestStoreFCMToken, db: Session = Depends(get_db)):
+    try:
+        return response_module.register_peer_token(db, params.uuid, params.fcm_token)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Presence: returns which of the supplied peer uuids are "reachable & available" — i.e. they have
+# a live signaling socket (active_connections) AND are active (is_active = 1). The app uses this to
+# drop both killed peers (socket gone within seconds) and peers who set themselves inactive, from
+# everyone else's nearby list.
+@app.post("/v1/peers_online/", dependencies=[Depends(verify_api_key)])
+async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)):
+    connected = [uid for uid in params.uuids if uid in manager.active_connections]
+    if not connected:
+        return {"online": []}
+    online = response_module.filter_active_peers(db, connected)
+    return {"online": online}
+
+# Marks friend_uuid as a friend of uuid (inserts a link into user_user). X-API-Key only.
+@app.post("/v1/add_friend/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+async def add_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
+    try:
+        return response_module.add_friend(db, params.uuid, params.friend_uuid)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Ends the friendship between uuid and friend_uuid (removes the user_user link). X-API-Key only.
+@app.post("/v1/cancel_friend/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+async def cancel_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
+    try:
+        return response_module.cancel_friend(db, params.uuid, params.friend_uuid)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Sets the user's active/inactive flag (is_active). X-API-Key only.
+@app.post("/v1/activate_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+async def activate_user(params: RequestActivateUser, db: Session = Depends(get_db)):
+    try:
+        return response_module.activate_user(db, params.uuid, params.is_active)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Returns all of the user's friends (nearby or not) with their profile + image, as {"friends": [...]}.
+@app.post("/v1/friends/", dependencies=[Depends(verify_api_key)])
+async def get_friends(params: RequestId, db: Session = Depends(get_db)):
+    try:
+        friends = response_module.get_friends(db, params.uuid)
+        for f in friends:
+            file_path = os.path.join(PROFILE_DIR, f"peer_{f['uuid']}.jpg")
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as fh:
+                    f["image_data"] = base64.b64encode(fh.read()).decode("ascii")
+        return {"friends": friends}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Endpoint to look up a peer by its hex uuid. The uuid is supplied in the JSON body
+# ({"uuid": ...}) so the iOS app reuses its standard postRequestForJson helper
+# (X-API-Key, no OAuth), like the other peer calls.
+@app.post("/v1/peer/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+async def get_peer_post(params: RequestId, db: Session = Depends(get_db)):
+    try:
+        response = response_module.get_peer(db, params.uuid)
+
+        # Attach the profile image (saved as peer_{uuid_hex}.jpg by create_peer)
+        # as a base64 string, mirroring how it is supplied on creation.
+        file_path = os.path.join(PROFILE_DIR, f"peer_{params.uuid}.jpg")
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                response.image_data = base64.b64encode(f.read()).decode("ascii")
+
+        return response
+
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Endpoint to update an existing peer. The peer is identified by its hex uuid in the
+# JSON body; name, about_me and image_data are all optional so callers can update only
+# the fields they supply (same iOS postRequestForJson helper as the other peer calls).
+@app.post("/v1/update_peer/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+async def update_peer(params: RequestUpdatePeer, db: Session = Depends(get_db)):
+    message = ""
+    result = False
+    peer_hex = params.uuid
+    try:
+        if params.image_data:
+            try:
+                # Overwrite the existing profile image (peer_{uuid_hex}.jpg).
+                filename = f"peer_{peer_hex}.jpg"
+                file_path = os.path.join(PROFILE_DIR, filename)
+
+                img_bytes = base64.b64decode(params.image_data)
+                with open(file_path, "wb") as f:
+                    f.write(img_bytes)
+
+                image_filename = filename
+                message = image_filename
+
+            except Exception as img_err:
+                message = f"Image save failed: {img_err}"
+                image_filename = ""
+
+        response = response_module.update_peer(db, peer_hex, params.name, params.about_me)
+
+        # Return the stored profile image alongside the updated fields, mirroring get_peer.
+        file_path = os.path.join(PROFILE_DIR, f"peer_{peer_hex}.jpg")
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                response.image_data = base64.b64encode(f.read()).decode("ascii")
+
+        result = True
+        return response
+
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        message = message.replace("Exception error: ", "")
+        # No peripheral involved in a peer update; log against the peer's hex uuid.
+        response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
+
+# Endpoint to update only a peer's profile image. The peer is identified by its hex
+# uuid; image_data is the base64 image to store as peer_{uuid_hex}.jpg.
+@app.post("/v1/update_peer_image/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+async def update_peer_image(params: RequestUpdatePeerImage, db: Session = Depends(get_db)):
+    message = ""
+    result = False
+    peer_hex = params.uuid
+    try:
+        # Confirm the peer exists (and load its current fields) before writing the image.
+        response = response_module.get_peer(db, peer_hex)
+
+        try:
+            # Overwrite the existing profile image (peer_{uuid_hex}.jpg).
+            filename = f"peer_{peer_hex}.jpg"
+            file_path = os.path.join(PROFILE_DIR, filename)
+
+            img_bytes = base64.b64decode(params.image_data)
+            with open(file_path, "wb") as f:
+                f.write(img_bytes)
+
+            image_filename = filename
+            message = image_filename
+
+        except Exception as img_err:
+            message = f"Image save failed: {img_err}"
+            image_filename = ""
+
+        # Return the stored profile image alongside the peer fields, mirroring get_peer.
+        file_path = os.path.join(PROFILE_DIR, f"peer_{peer_hex}.jpg")
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                response.image_data = base64.b64encode(f.read()).decode("ascii")
+
+        result = True
+        return response
+
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        message = message.replace("Exception error: ", "")
+        # No peripheral involved in a peer update; log against the peer's hex uuid.
+        response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
+
+# Endpoint to update only a peer's name. The peer is identified by its hex uuid.
+@app.post("/v1/update_peer_name/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+async def update_peer_name(params: RequestUpdatePeerName, db: Session = Depends(get_db)):
+    message = ""
+    result = False
+    peer_hex = params.uuid
+    try:
+        response = response_module.update_peer(db, peer_hex, name=params.name)
+
+        # Return the stored profile image alongside the updated fields, mirroring get_peer.
+        file_path = os.path.join(PROFILE_DIR, f"peer_{peer_hex}.jpg")
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                response.image_data = base64.b64encode(f.read()).decode("ascii")
+
+        result = True
+        return response
+
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        message = message.replace("Exception error: ", "")
+        # No peripheral involved in a peer update; log against the peer's hex uuid.
+        response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
+
+# Endpoint to update only a peer's about_me. The peer is identified by its hex uuid.
+@app.post("/v1/update_peer_about_me/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+async def update_peer_about_me(params: RequestUpdatePeerAboutMe, db: Session = Depends(get_db)):
+    message = ""
+    result = False
+    peer_hex = params.uuid
+    try:
+        response = response_module.update_peer(db, peer_hex, about_me=params.about_me)
+
+        # Return the stored profile image alongside the updated fields, mirroring get_peer.
+        file_path = os.path.join(PROFILE_DIR, f"peer_{peer_hex}.jpg")
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                response.image_data = base64.b64encode(f.read()).decode("ascii")
+
+        result = True
+        return response
+
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    finally:
+        message = message.replace("Exception error: ", "")
+        # No peripheral involved in a peer update; log against the peer's hex uuid.
+        response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
+
 # Endpoint for login and 2FA token generation
 @app.post("/v1/set_2fatoken/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
 async def login_and_set_2fatoken(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -679,19 +1100,19 @@ async def update_user(params: RequestSetUser, username: response_module.Response
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-@app.post("/v1/activate_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
-async def activate_user(params: RequestActivateUser, username: response_module.ResponseUsername = Depends(check_credentials), db: Session = Depends(get_db)):
-    try:
-        if username: #if creditential valid => email
-            if response_module.check_is_super_admin(db, username.email):
-                response = response_module.activate_user(db, params.id, params.is_active)
-                response_module.log_online_action(db, "", params.uuid, 13 if params.is_active else 14, True, "", params.id, "")
-                return response
-
-        raise Exception(f"Exception error: Unauthorized")
-
-    except Exception as e:
-        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+# @app.post("/v1/activate_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+# async def activate_user(params: RequestActivateUser, username: response_module.ResponseUsername = Depends(check_credentials), db: Session = Depends(get_db)):
+#     try:
+#         if username: #if creditential valid => email
+#             if response_module.check_is_super_admin(db, username.email):
+#                 response = response_module.activate_user(db, params.id, params.is_active)
+#                 response_module.log_online_action(db, "", params.uuid, 13 if params.is_active else 14, True, "", params.id, "")
+#                 return response
+#
+#         raise Exception(f"Exception error: Unauthorized")
+#
+#     except Exception as e:
+#         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @app.post("/v1/add_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
 async def add_user(params: RequestAddUser, username: response_module.ResponseUsername = Depends(check_credentials), db: Session = Depends(get_db)):
@@ -921,14 +1342,14 @@ async def stop_safexs_doorbell(params: RequestNotifySafeXS,  username: response_
 
 
 
-@app.post("/v1/bellxs_image/", response_model=response_module.ResponseImage, dependencies=[Depends(verify_api_key)])
-async def post_bellxs_image(params: RequestGetImage, username: response_module.ResponseUsername = Depends(check_credentials), db: Session = Depends(get_db)):
+@app.post("/v1/peer_image/", response_model=response_module.ResponseImage, dependencies=[Depends(verify_api_key)])
+async def post_peer_image(params: RequestGetImage, db: Session = Depends(get_db)):
     """
     Retrieves the image file, converts it to Base64, and returns it in JSON.
     """
     # 1. Verify Authentication
-    if not username:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+    # if not username:
+    #     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
     # 2. Security Check (Directory Traversal)
     filename = params.image_filename
@@ -936,7 +1357,7 @@ async def post_bellxs_image(params: RequestGetImage, username: response_module.R
         return response_module.ResponseImage(success=False, image_data="", error="Invalid filename")
 
     # 3. Construct path
-    file_path = os.path.join("static/snapshots", filename)
+    file_path = os.path.join("static/profile_images", filename)
 
     # 4. Read File and Encode
     if os.path.exists(file_path):
