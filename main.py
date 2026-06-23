@@ -215,14 +215,21 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 if msg_type in ("CHAT_REQUEST", "CALL_REQUEST") and not response_module.are_friends(s, client_id, target_id):
                                     print(f"relay: {msg_type} to offline {target_id[:8]} suppressed (sender not a friend)")
                                 else:
-                                    token, _ = response_module.get_peer_push_info(s, target_id)
-                                    _, sender_name = response_module.get_peer_push_info(s, client_id)
-                                    if token:
-                                        # Carry the call's audio/video flag through to the push.
-                                        extra = {"video": "1" if data.get("video") else "0"} if msg_type == "CALL_REQUEST" else None
-                                        ok = response_module.send_signal_push(token, msg_type, client_id, sender_name, extra)
-                                        print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={ok}")
-                                    else:
+                                    fcm_token, _, voip_token = response_module.get_peer_push_info(s, target_id)
+                                    _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
+                                    # Carry the call's audio/video flag through to the push.
+                                    extra = {"video": "1" if data.get("video") else "0"} if msg_type == "CALL_REQUEST" else None
+                                    sent = False
+                                    # A CALL to a CallKit-capable peer → native VoIP push (rings via
+                                    # CallKit from a killed/locked state). Everything else (chat/friend,
+                                    # or a peer with no VoIP token e.g. China) → FCM notification.
+                                    if msg_type == "CALL_REQUEST" and voip_token:
+                                        sent = response_module.send_voip_push(voip_token, msg_type, client_id, sender_name, extra)
+                                        print(f"relay: VoIP push to {target_id[:8]} {msg_type} sent={sent}")
+                                    if not sent and fcm_token:
+                                        sent = response_module.send_signal_push(fcm_token, msg_type, client_id, sender_name, extra)
+                                        print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={sent}")
+                                    if not sent and not voip_token and not fcm_token:
                                         print(f"relay: offline target {target_id[:8]} has no push token")
                             finally:
                                 s.close()
@@ -296,6 +303,10 @@ class RequestAddFriend(BaseModel):
     uuid: str
     friend_uuid: str
 
+class RequestBlockPeer(BaseModel):
+    uuid: str          # the blocker (authenticated by check_peer_uuid)
+    blocked_uuid: str  # the peer being blocked
+
 class RequestActivateUser(BaseModel):
     uuid: str
     is_active: bool
@@ -338,6 +349,10 @@ class RequestUuIdBleId(BaseModel):
 class RequestStoreFCMToken(BaseModel):
     uuid: str
     fcm_token: str
+
+class RequestStoreVoipToken(BaseModel):
+    uuid: str
+    voip_token: str
 
 class RequestLogOnline(BaseModel):
     uuid: str
@@ -752,6 +767,17 @@ async def register_peer_token(params: RequestStoreFCMToken, db: Session = Depend
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# Stores a peer's PushKit VoIP token so the relay can wake it with a native CallKit incoming-call
+# screen for a call (killed/locked). Same X-API-Key + uuid-hex-keyed pattern as register_peer_token.
+@app.post("/v1/register_peer_voip_token/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def register_peer_voip_token(params: RequestStoreVoipToken, db: Session = Depends(get_db)):
+    try:
+        return response_module.register_peer_voip_token(db, params.uuid, params.voip_token)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # Presence: returns which of the supplied peer uuids are "reachable & available" — i.e. they have
 # a live signaling socket (active_connections) AND are active (is_active = 1). The app uses this to
 # drop both killed peers (socket gone within seconds) and peers who set themselves inactive, from
@@ -762,7 +788,21 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     if not connected:
         return {"online": []}
     online = response_module.filter_active_peers(db, connected)
+    # Drop peers this caller has blocked (or who blocked them) so they vanish from the nearby list.
+    blocked = response_module.blocked_peer_set(db, params.uuid, online)
+    online = [u for u in online if u not in blocked]
     return {"online": online}
+
+# Permanently blocks a peer for this user: marks (or creates) their user_user link is_active = 0, so
+# the combination disappears from nearby + friends and can no longer wake either side. X-API-Key only.
+@app.post("/v1/block_peer/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def block_peer(params: RequestBlockPeer, db: Session = Depends(get_db)):
+    try:
+        return response_module.block_peer(db, params.uuid, params.blocked_uuid)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # Marks friend_uuid as a friend of uuid (inserts a link into user_user). X-API-Key only.
 @app.post("/v1/add_friend/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
@@ -859,6 +899,25 @@ async def get_peer_post(params: RequestPeerLookup, db: Session = Depends(get_db)
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# PUBLIC (no API key / no caller uuid): the WhatsApp-invite landing page on peers.club fetches the
+# inviter's name to personalise itself ("<name> invited you to PEERS.CLUB"). A not-yet-installed
+# visitor has no peer id, so this can't use the authenticated /v1/peer/ lookup. Only a name is
+# returned, keyed by a random 128-bit uuid (not enumerable). The Access-Control-Allow-Origin header
+# lets the peers.club page read it cross-origin (simple GET → no preflight needed).
+@app.get("/v1/invite_info/{uuid}")
+async def invite_info(uuid: str, response: fastapi.Response, db: Session = Depends(get_db)):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    name = response_module.get_peer_name(db, uuid)
+    # Profile image (base64 JPEG), same source as /v1/peer/. Only read it when the name resolved —
+    # which means get_peer_name validated `uuid` as proper hex, so the f"peer_{uuid}.jpg" path is safe.
+    image_data = ""
+    if name is not None:
+        file_path = os.path.join(PROFILE_DIR, f"peer_{uuid}.jpg")
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                image_data = base64.b64encode(f.read()).decode("ascii")
+    return {"success": name is not None, "name": name or "", "image_data": image_data}
 
 # Endpoint to update an existing peer. The peer is identified by its hex uuid in the
 # JSON body; name, about_me and image_data are all optional so callers can update only

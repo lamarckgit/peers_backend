@@ -16,6 +16,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 import string
 import time
+import os
+import httpx
+import jwt
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -647,21 +650,64 @@ def register_peer_token(db: Session, peer_hex: str, token: str):
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
+def register_peer_voip_token(db: Session, peer_hex: str, token: str):
+    """Stores a peer's PushKit VoIP token (user.voip_token) so the relay can wake it with a native
+    CallKit incoming-call screen for a call. Same X-API-Key / uuid-hex-keyed pattern as
+    register_peer_token. Only CallKit-capable (non-China) peers register a VoIP token."""
+    try:
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except ValueError:
+            raise Exception("Invalid peer uuid")
+        if len(peer_uuid) != 16:
+            raise Exception("Invalid peer uuid")
+
+        update_query = text("""
+        UPDATE user SET voip_token = :token WHERE uuid = :uuid AND is_active = 1
+        """)
+        result = db.execute(update_query, {"token": token, "uuid": peer_uuid})
+        db.commit()
+        if result.rowcount == 0:
+            raise Exception("Peer not found")
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
 def get_peer_push_info(db: Session, peer_hex: str):
-    """Returns (fcm_token, name) for a peer by hex uuid; (None, "") when unknown/invalid."""
+    """Returns (fcm_token, name, voip_token) for a peer by hex uuid; (None, "", None) when
+    unknown/invalid. voip_token is set only for CallKit-capable peers (used for call wake-ups)."""
     try:
         peer_uuid = bytes.fromhex(peer_hex)
     except ValueError:
-        return (None, "")
+        return (None, "", None)
     if len(peer_uuid) != 16:
-        return (None, "")
+        return (None, "", None)
     row = db.execute(
-        text("SELECT fcm_token, name FROM user WHERE uuid = :uuid AND is_active = 1"),
+        text("SELECT fcm_token, name, voip_token FROM user WHERE uuid = :uuid AND is_active = 1"),
         {"uuid": peer_uuid},
     ).mappings().fetchone()
     if not row:
-        return (None, "")
-    return (row["fcm_token"], row["name"] or "")
+        return (None, "", None)
+    return (row["fcm_token"], row["name"] or "", row["voip_token"])
+
+def get_peer_name(db: Session, peer_hex: str):
+    """Public name-only lookup for the invite landing page (no caller auth — a not-yet-installed
+    visitor has no peer id). Returns the peer's name, or None if the uuid is unknown/invalid. Safe to
+    expose: a peer uuid is a random 128-bit value, so names aren't enumerable, and only a name is returned."""
+    try:
+        peer_uuid = bytes.fromhex(peer_hex)
+    except ValueError:
+        return None
+    if len(peer_uuid) != 16:
+        return None
+    row = db.execute(
+        text("SELECT name FROM user WHERE uuid = :uuid AND is_active = 1"),
+        {"uuid": peer_uuid},
+    ).mappings().fetchone()
+    return (row["name"] if row and row["name"] else None)
 
 def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extra: dict = None):
     """Builds the (data, AndroidConfig, APNSConfig) shared by the single- and multi-recipient signal
@@ -733,6 +779,81 @@ def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_n
         return True
     except Exception as e:
         print(f"send_signal_push error [{type(e).__name__}]: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------------------------
+# Direct APNs PushKit VoIP sender. FCM CANNOT deliver VoIP pushes (they need a separate PushKit
+# token), so this talks to APNs HTTP/2 directly to wake a killed/locked peer so CallKit shows the
+# native incoming-call screen. Auth is a provider JWT (ES256) signed with the APNs Auth Key (.p8) —
+# this .p8 lives ON THE BACKEND and is SEPARATE from the one uploaded to Firebase for FCM.
+#
+# The KEY_ID and TEAM_ID below are NOT secrets (the Key ID is sent to Apple in every JWT) — they're
+# set here for an env-var-free install; an env var still overrides on another server. Only the .p8
+# FILE is secret (keep it out of git, like serviceAccountKeyPeersClub.json). Values are your Apple
+# team (3V394W95NG) and its APNs key (6XMZLTFG8H). VERIFY the Key ID matches the .p8 you deploy: if
+# your peers-club .p8 is a DIFFERENT key than the SafeXS-team one, put ITS Key ID here.
+# ---------------------------------------------------------------------------------------------
+APNS_AUTH_KEY_PATH = os.environ.get("APNS_AUTH_KEY_PATH", "AuthKeyPeersClub.p8")
+APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "M2RKXMS874") #6XMZLTFG8H
+APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "3V394W95NG")
+APNS_VOIP_TOPIC = os.environ.get("APNS_VOIP_TOPIC", "club.peers.ios.voip")
+_APNS_HOST_PROD = "api.push.apple.com"
+_APNS_HOST_SANDBOX = "api.sandbox.push.apple.com"
+
+_apns_jwt = {"token": None, "iat": 0}
+_apns_client = None
+
+def _apns_auth_token():
+    """Cached APNs provider JWT (ES256), refreshed every 40 min (Apple accepts 20–60 min)."""
+    now = int(time.time())
+    if _apns_jwt["token"] and now - _apns_jwt["iat"] < 2400:
+        return _apns_jwt["token"]
+    with open(APNS_AUTH_KEY_PATH, "r") as f:
+        key = f.read()
+    token = jwt.encode({"iss": APNS_TEAM_ID, "iat": now}, key, algorithm="ES256", headers={"kid": APNS_KEY_ID})
+    _apns_jwt["token"] = token
+    _apns_jwt["iat"] = now
+    return token
+
+def _apns_post(host: str, voip_token: str, payload: dict, auth: str):
+    global _apns_client
+    if _apns_client is None:
+        _apns_client = httpx.Client(http2=True, timeout=10.0)   # keeps the HTTP/2 connection alive
+    headers = {
+        "authorization": f"bearer {auth}",
+        "apns-topic": APNS_VOIP_TOPIC,
+        "apns-push-type": "voip",
+        "apns-priority": "10",
+        "apns-expiration": "0",
+    }
+    return _apns_client.post(f"https://{host}/3/device/{voip_token}", json=payload, headers=headers)
+
+def send_voip_push(voip_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None) -> bool:
+    """Sends a PushKit VoIP push DIRECTLY to APNs so a killed/locked peer rings via CallKit. The
+    payload's top-level keys (action/sender_id/sender_name/video) match what the iOS PushKit handler
+    reads. Tries production APNs, retrying sandbox on BadDeviceToken (dev builds use sandbox tokens).
+    False (no raise) on not-configured / empty-token / error — caller can then fall back to FCM."""
+    if not voip_token:
+        return False
+    if not (APNS_KEY_ID and APNS_TEAM_ID):
+        print("send_voip_push: APNS_KEY_ID/APNS_TEAM_ID not configured — VoIP push skipped.")
+        return False
+    payload = {"aps": {}, "action": msg_type, "sender_id": sender_hex, "sender_name": sender_name or ""}
+    if extra:
+        payload.update(extra)
+    try:
+        auth = _apns_auth_token()
+        resp = _apns_post(_APNS_HOST_PROD, voip_token, payload, auth)
+        if resp.status_code == 400 and "BadDeviceToken" in resp.text:
+            resp = _apns_post(_APNS_HOST_SANDBOX, voip_token, payload, auth)
+        if resp.status_code == 200:
+            print(f"send_voip_push: {msg_type} from {sender_hex[:8]} → 200")
+            return True
+        print(f"send_voip_push error: {resp.status_code} {resp.text}")
+        return False
+    except Exception as e:
+        print(f"send_voip_push error [{type(e).__name__}]: {e}")
         return False
 
 
@@ -841,9 +962,9 @@ def cancel_friend(db: Session, user_hex: str, friend_hex: str):
         raise Exception(f"Exception error: {str(e)}")
 
 def are_friends(db: Session, hex_a: str, hex_b: str) -> bool:
-    """True if a user_user link exists between the two peers (either direction). Used to gate the
-    killed/offline FCM wake to friends only — a non-friend nearby peer can reach you only while
-    your app is running and connected to the relay."""
+    """True if an ACTIVE user_user link exists between the two peers (either direction). Used to gate
+    the killed/offline FCM wake to friends only. is_active = 0 means the combination is BLOCKED, so a
+    blocked pair are NOT friends (and a block can't wake the other)."""
     try:
         a = bytes.fromhex(hex_a)
         b = bytes.fromhex(hex_b)
@@ -854,12 +975,71 @@ def are_friends(db: Session, hex_a: str, hex_b: str) -> bool:
     try:
         row = db.execute(
             text("""SELECT 1 FROM user_user
-                    WHERE (uuid_1 = :a AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :a) LIMIT 1"""),
+                    WHERE ((uuid_1 = :a AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :a))
+                      AND is_active = 1 LIMIT 1"""),
             {"a": a, "b": b},
         ).fetchone()
         return row is not None
     except SQLAlchemyError:
         return False
+
+def block_peer(db: Session, user_hex: str, blocked_hex: str):
+    """Permanently blocks the combination of two peers by marking their user_user link is_active = 0
+    (creating the link if none exists). A blocked combination is excluded everywhere — are_friends,
+    get_friends and peers_online all require is_active = 1. Idempotent; either direction is matched."""
+    try:
+        try:
+            u = bytes.fromhex(user_hex)
+            b = bytes.fromhex(blocked_hex)
+        except ValueError:
+            raise Exception("Invalid uuid")
+        if len(u) != 16 or len(b) != 16:
+            raise Exception("Invalid uuid")
+        if u == b:
+            raise Exception("Cannot block yourself")
+        result = db.execute(
+            text("""UPDATE user_user SET is_active = 0
+                    WHERE (uuid_1 = :u AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :u)"""),
+            {"u": u, "b": b},
+        )
+        if result.rowcount == 0:
+            db.execute(
+                text("INSERT INTO user_user (uuid_1, uuid_2, is_active) VALUES (:u, :b, 0)"),
+                {"u": u, "b": b},
+            )
+        db.commit()
+        return ResponseResult(success=True, error="")
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def blocked_peer_set(db: Session, user_hex: str, peer_hexes):
+    """Returns the subset of peer_hexes that are BLOCKED with user_hex (a user_user link with
+    is_active = 0 in either direction), so peers_online can drop them from the nearby list."""
+    try:
+        me = bytes.fromhex(user_hex)
+    except (ValueError, TypeError):
+        return set()
+    if len(me) != 16:
+        return set()
+    blocked = set()
+    for peer_hex in peer_hexes:
+        try:
+            p = bytes.fromhex(peer_hex)
+        except (ValueError, TypeError):
+            continue
+        if len(p) != 16:
+            continue
+        row = db.execute(
+            text("""SELECT 1 FROM user_user
+                    WHERE ((uuid_1 = :me AND uuid_2 = :p) OR (uuid_1 = :p AND uuid_2 = :me))
+                      AND is_active = 0 LIMIT 1"""),
+            {"me": me, "p": p},
+        ).fetchone()
+        if row:
+            blocked.add(peer_hex)
+    return blocked
 
 def delete_peer(db: Session, peer_hex: str):
     """Permanently deletes a peer: removes any user_user friend links (both directions) and then
@@ -905,11 +1085,11 @@ def get_friends(db: Session, user_hex: str):
         text("""
         SELECT u.uuid AS fuid, u.name AS name, u.about_me AS about_me
         FROM user_user uu JOIN user u ON u.uuid = uu.uuid_2
-        WHERE uu.uuid_1 = :me
+        WHERE uu.uuid_1 = :me AND uu.is_active = 1
         UNION
         SELECT u.uuid AS fuid, u.name AS name, u.about_me AS about_me
         FROM user_user uu JOIN user u ON u.uuid = uu.uuid_1
-        WHERE uu.uuid_2 = :me
+        WHERE uu.uuid_2 = :me AND uu.is_active = 1
         """),
         {"me": user_uuid},
     ).mappings().fetchall()
