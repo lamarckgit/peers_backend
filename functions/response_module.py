@@ -601,6 +601,26 @@ def get_peer(db: Session, peer_hex: str):
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
+def peer_exists(db: Session, peer_hex: str) -> bool:
+    """True if a row with this uuid exists in the user table — regardless of is_active, so an
+    inactive peer (who set themselves invisible) can still reach activate_user and the other peer
+    endpoints. Backs the check_peer_uuid auth gate and the /v1/check_peer/ launch check; a
+    malformed/short hex simply returns False rather than raising."""
+    try:
+        peer_uuid = bytes.fromhex(peer_hex)
+    except (ValueError, TypeError):
+        return False
+    if len(peer_uuid) != 16:
+        return False
+    try:
+        row = db.execute(
+            text("SELECT 1 FROM user WHERE uuid = :uuid LIMIT 1"),
+            {"uuid": peer_uuid},
+        ).fetchone()
+        return row is not None
+    except SQLAlchemyError:
+        return False
+
 def register_peer_token(db: Session, peer_hex: str, token: str):
     """Stores a peer's FCM push token (in the user table's fcm_token column), so the relay can
     wake/ring the peer with an INCOMING_CHAT push when its app is backgrounded. X-API-Key only —
@@ -643,49 +663,115 @@ def get_peer_push_info(db: Session, peer_hex: str):
         return (None, "")
     return (row["fcm_token"], row["name"] or "")
 
-def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str) -> bool:
-    """Pushes a signaling event (chat or friend handshake) to a backgrounded/killed peer via the
-    PEERS.CLUB Firebase app, as a time-sensitive alert (breaks through Focus / Do Not Disturb).
-    `msg_type` is the WS signal type; the iOS-facing action is INCOMING_CHAT for a chat request and
-    the same FRIEND_* string otherwise. Returns False (no raise) if not configured / on error."""
-    if app_peers is None:
-        print("send_signal_push: PEERS.CLUB Firebase app not configured — push skipped.")
-        return False
-    if not target_token:
-        return False
+def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extra: dict = None):
+    """Builds the (data, AndroidConfig, APNSConfig) shared by the single- and multi-recipient signal
+    pushes, so both fan-outs stay byte-for-byte identical. Mirrors the SafeXS doorbell push
+    (notify_safexs_doorbell), proven to reach force-quit apps:
+      • an aps.alert built via ApsAlert (no top-level `notification`),
+      • sound="default" so even a force-quit app (where the in-app ringer can't run) makes an
+        audible system sound on the lock screen,
+      • content_available=True so a merely-suspended app is woken to ring, and
+      • an explicit apns-push-type=alert header (priority 10) so APNs delivers+shows it rather than
+        dropping it as a background push. No interruption-level → no 'TIME SENSITIVE' banner label.
+    The iOS-facing action is INCOMING_CHAT for a chat request, INCOMING_CALL for a call request, and
+    the same FRIEND_* string otherwise. `extra` adds string key/values to data (e.g. a call's video
+    flag). Returns (data, android_config, apns_config)."""
     name = sender_name or "A peer"
     copy = {
         "CHAT_REQUEST":   ("Incoming chat",     f"{name} wants to chat"),
+        "CALL_REQUEST":   ("Incoming call",     f"{name} is calling"),
         "FRIEND_REQUEST": ("Friend Request",    f"{name} wants to be friends"),
         "FRIEND_ACCEPT":  ("New friend",        f"You're friends now with {name}"),
         "NOFRIEND":       ("Friend request",    f"{name} declined your friend request"),
         "UNFRIEND":       ("Friendship ended",  f"{name} ended the friendship"),
     }
     title, body = copy.get(msg_type, ("PEERS.CLUB", "New activity"))
-    # iOS routes chat via the INCOMING_CHAT action; friend actions match the WS type verbatim.
-    fcm_action = "INCOMING_CHAT" if msg_type == "CHAT_REQUEST" else msg_type
+    # iOS routing actions: chat → INCOMING_CHAT, call → INCOMING_CALL, friend → the WS type verbatim.
+    fcm_action = {"CHAT_REQUEST": "INCOMING_CHAT", "CALL_REQUEST": "INCOMING_CALL"}.get(msg_type, msg_type)
+    data = {"action": fcm_action, "sender_id": sender_hex, "sender_name": name}
+    if extra:
+        data.update({k: str(v) for k, v in extra.items()})
+    aps_object = messaging.Aps(
+        alert=messaging.ApsAlert(title=title, body=body),
+        sound="default",
+        content_available=True,
+        # Time Sensitive so a killed/backgrounded app's call/chat banner is prominent, retained on the
+        # lock screen, and breaks through Focus/Do Not Disturb — matching the in-app local notification.
+        custom_data={"interruption-level": "time-sensitive"},
+    )
+    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    apns_config = messaging.APNSConfig(
+        headers={"apns-priority": "10", "apns-push-type": "alert"},
+        payload=messaging.APNSPayload(aps=aps_object),
+    )
+    return data, android_config, apns_config
+
+
+def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None) -> bool:
+    """Pushes a signaling event (chat / friend / call) to ONE backgrounded/killed peer via the
+    PEERS.CLUB Firebase app. Payload is built by _build_signal_payload (mirrors the SafeXS doorbell
+    push). For fanning the same signal out to several devices (group calls) use send_signal_push_multi.
+    False (no raise) on not-configured / empty-token / error.
+
+    NOTE: delivery to iOS requires the peers-club Firebase project to have an APNs Authentication Key
+    configured (Project Settings → Cloud Messaging). Without it FCM returns THIRD_PARTY_AUTH_ERROR."""
+    if app_peers is None:
+        print("send_signal_push: PEERS.CLUB Firebase app not configured — push skipped.")
+        return False
+    if not target_token:
+        return False
+    data, android_config, apns_config = _build_signal_payload(msg_type, sender_hex, sender_name, extra)
     try:
         message = messaging.Message(
             token=target_token,
-            notification=messaging.Notification(title=title, body=body),
-            data={"action": fcm_action, "sender_id": sender_hex, "sender_name": name},
-            apns=messaging.APNSConfig(
-                headers={"apns-priority": "10"},
-                payload=messaging.APNSPayload(
-                    aps=messaging.Aps(
-                        sound="default",
-                        content_available=True,
-                        custom_data={"interruption-level": "time-sensitive"},
-                    ),
-                ),
-            ),
+            data=data,
+            android=android_config,
+            apns=apns_config,
         )
         response = messaging.send(message, app=app_peers)
         print(f"send_signal_push: {msg_type} from {sender_hex[:8]} → {response}")
         return True
     except Exception as e:
-        print(f"send_signal_push error: {e}")
+        print(f"send_signal_push error [{type(e).__name__}]: {e}")
         return False
+
+
+def send_signal_push_multi(target_tokens, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None) -> int:
+    """Multicast variant of send_signal_push: fans the SAME signal out to several devices at once —
+    groundwork for group calls (ring every group member's phone with one call). Reuses the exact
+    SafeXS-mirroring payload via _build_signal_payload, so single- and multi-recipient pushes are
+    identical. Empty/None and duplicate tokens are dropped; the rest are sent in batches of 500 (the
+    FCM multicast limit) via send_each_for_multicast. Returns the number of devices APNs/FCM accepted
+    the push for (0 on not-configured / no-tokens; partial counts survive per-token failures)."""
+    if app_peers is None:
+        print("send_signal_push_multi: PEERS.CLUB Firebase app not configured — push skipped.")
+        return 0
+    # De-dupe while preserving order, dropping falsy tokens (same peer on two devices → one entry).
+    tokens = list(dict.fromkeys(t for t in (target_tokens or []) if t))
+    if not tokens:
+        return 0
+    data, android_config, apns_config = _build_signal_payload(msg_type, sender_hex, sender_name, extra)
+    sent = 0
+    try:
+        for i in range(0, len(tokens), 500):
+            batch = tokens[i:i + 500]
+            multicast = messaging.MulticastMessage(
+                tokens=batch,
+                data=data,
+                android=android_config,
+                apns=apns_config,
+            )
+            resp = messaging.send_each_for_multicast(multicast, app=app_peers)
+            sent += resp.success_count
+            if resp.failure_count:
+                for idx, r in enumerate(resp.responses):
+                    if not r.success:
+                        print(f"send_signal_push_multi: token {batch[idx][:12]}… failed: {r.exception}")
+        print(f"send_signal_push_multi: {msg_type} from {sender_hex[:8]} → {sent}/{len(tokens)} delivered")
+        return sent
+    except Exception as e:
+        print(f"send_signal_push_multi error [{type(e).__name__}]: {e}")
+        return sent
 
 def send_chat_push(target_token: str, sender_hex: str, sender_name: str) -> bool:
     """Backward-compatible wrapper — a chat request push."""
@@ -745,6 +831,56 @@ def cancel_friend(db: Session, user_hex: str, friend_hex: str):
         WHERE (uuid_1 = :u AND uuid_2 = :f) OR (uuid_1 = :f AND uuid_2 = :u)
             """),
             {"u": user_uuid, "f": friend_uuid},
+        )
+        db.commit()
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def are_friends(db: Session, hex_a: str, hex_b: str) -> bool:
+    """True if a user_user link exists between the two peers (either direction). Used to gate the
+    killed/offline FCM wake to friends only — a non-friend nearby peer can reach you only while
+    your app is running and connected to the relay."""
+    try:
+        a = bytes.fromhex(hex_a)
+        b = bytes.fromhex(hex_b)
+    except (ValueError, TypeError):
+        return False
+    if len(a) != 16 or len(b) != 16:
+        return False
+    try:
+        row = db.execute(
+            text("""SELECT 1 FROM user_user
+                    WHERE (uuid_1 = :a AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :a) LIMIT 1"""),
+            {"a": a, "b": b},
+        ).fetchone()
+        return row is not None
+    except SQLAlchemyError:
+        return False
+
+def delete_peer(db: Session, peer_hex: str):
+    """Permanently deletes a peer: removes any user_user friend links (both directions) and then
+    the user row itself. The profile image file is removed by the endpoint (which owns PROFILE_DIR).
+    X-API-Key only; idempotent — deleting an already-gone peer still returns success."""
+    try:
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except (ValueError, TypeError):
+            raise Exception("Invalid peer uuid")
+        if len(peer_uuid) != 16:
+            raise Exception("Invalid peer uuid")
+
+        # Remove friend links first (either direction), then the user row.
+        db.execute(
+            text("DELETE FROM user_user WHERE uuid_1 = :uuid OR uuid_2 = :uuid"),
+            {"uuid": peer_uuid},
+        )
+        db.execute(
+            text("DELETE FROM user WHERE uuid = :uuid"),
+            {"uuid": peer_uuid},
         )
         db.commit()
         return ResponseResult(success=True, error="")

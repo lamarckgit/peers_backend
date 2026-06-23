@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 import logging
 import os
 import ssl
@@ -202,18 +204,26 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                 if not delivered:
                     # Signal types that warrant a push when the target is offline
-                    # (backgrounded/killed): chat request + the friend handshake.
-                    if msg_type in ("CHAT_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND"):
+                    # (backgrounded/killed): chat request, call request + the friend handshake.
+                    if msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND"):
                         try:
                             s = database.create_session()
                             try:
-                                token, _ = response_module.get_peer_push_info(s, target_id)
-                                _, sender_name = response_module.get_peer_push_info(s, client_id)
-                                if token:
-                                    ok = response_module.send_signal_push(token, msg_type, client_id, sender_name)
-                                    print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={ok}")
+                                # Privacy: only a Friend may wake a killed/offline peer for a chat or
+                                # call. The friend handshake itself (FRIEND_*) is always allowed so
+                                # friend requests/answers can still reach an offline peer.
+                                if msg_type in ("CHAT_REQUEST", "CALL_REQUEST") and not response_module.are_friends(s, client_id, target_id):
+                                    print(f"relay: {msg_type} to offline {target_id[:8]} suppressed (sender not a friend)")
                                 else:
-                                    print(f"relay: offline target {target_id[:8]} has no push token")
+                                    token, _ = response_module.get_peer_push_info(s, target_id)
+                                    _, sender_name = response_module.get_peer_push_info(s, client_id)
+                                    if token:
+                                        # Carry the call's audio/video flag through to the push.
+                                        extra = {"video": "1" if data.get("video") else "0"} if msg_type == "CALL_REQUEST" else None
+                                        ok = response_module.send_signal_push(token, msg_type, client_id, sender_name, extra)
+                                        print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={ok}")
+                                    else:
+                                        print(f"relay: offline target {target_id[:8]} has no push token")
                             finally:
                                 s.close()
                         except Exception as e:
@@ -279,7 +289,8 @@ class RequestUpdatePeerAboutMe(BaseModel):
     about_me: str
 
 class RequestPeersOnline(BaseModel):
-    uuids: List[str]
+    uuid: str          # the calling peer's own uuid (authenticated by check_peer_uuid)
+    uuids: List[str]   # the peer uuids whose online/active status is being queried
 
 class RequestAddFriend(BaseModel):
     uuid: str
@@ -309,6 +320,12 @@ class RequestActivateUserLock(BaseModel):
 
 class RequestId(BaseModel):
     uuid: str
+
+# Peer profile lookup: `uuid` is the peer being viewed, `caller_uuid` is the requester's own id
+# (authenticated by check_peer_uuid — lookups are only allowed for registered peers).
+class RequestPeerLookup(BaseModel):
+    uuid: str
+    caller_uuid: str
 
 class RequestUuIdId(BaseModel):
     uuid: str
@@ -434,6 +451,27 @@ class RequestSetUserLock(BaseModel):
 def verify_api_key(api_key: str = Depends(api_key_header)):
     if api_key != license_manager.get_constants()["SECRET_API"]:
         raise HTTPException(status_code=401, detail="Invalid API Key")
+
+
+async def check_peer_uuid(request: Request, db: Session = Depends(get_db)):
+    """Auth gate for the PeersClub peer endpoints. On top of the shared X-API-Key it requires the
+    caller to present its own peer uuid in the JSON body and that uuid to exist in the user table —
+    rejecting unknown/forged/stale peers (e.g. a Keychain uuid left over after the DB row was
+    removed). create_peer is exempt (the uuid doesn't exist yet). Reading request.json() here is
+    safe: Starlette caches the body, so the endpoint's own Pydantic model still parses it."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+    # Authenticate the *calling* peer. On most endpoints the body's `uuid` IS the caller; on lookups
+    # where `uuid` is the target being viewed (e.g. /v1/peer/), the caller's own id is sent as
+    # `caller_uuid` and takes precedence so we validate the requester, not the requested.
+    peer_hex = (body.get("caller_uuid") or body.get("uuid")) if isinstance(body, dict) else None
+    if not isinstance(peer_hex, str) or not peer_hex:
+        raise HTTPException(status_code=401, detail="Missing peer uuid")
+    if not response_module.peer_exists(db, peer_hex):
+        raise HTTPException(status_code=403, detail="Unknown peer")
+    return peer_hex
 
 
 async def check_credentials(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
@@ -682,10 +720,30 @@ async def create_peer(params: RequestCreatePeer, db: Session = Depends(get_db)):
         # No peripheral involved in peer creation; log against the new peer's hex uuid.
         response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
 
+# Permanently deletes the calling peer: their user row, all friend links, and their profile image
+# (static/profile_images/peer_{uuid}.jpg). X-API-Key + check_peer_uuid — a peer can only delete
+# itself (the uuid in the body is the authenticated caller).
+@app.post("/v1/delete_peer/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
+    try:
+        result = response_module.delete_peer(db, params.uuid)
+        # Remove the profile image (peer_{uuid_hex}.jpg) if present.
+        file_path = os.path.join(PROFILE_DIR, f"peer_{params.uuid}.jpg")
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except OSError as e:
+                print(f"delete_peer: failed to remove image {file_path}: {e}")
+        return result
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # Registers a peer's FCM push token (so it can be woken/rung for an incoming chat while its app
 # is backgrounded). X-API-Key only — peers have no OAuth session — keyed by uuid hex in the body
 # ({"uuid": ..., "fcm_token": ...}), reusing the iOS postRequestForJson helper like create_peer.
-@app.post("/v1/register_peer_token/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/register_peer_token/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def register_peer_token(params: RequestStoreFCMToken, db: Session = Depends(get_db)):
     try:
         return response_module.register_peer_token(db, params.uuid, params.fcm_token)
@@ -698,7 +756,7 @@ async def register_peer_token(params: RequestStoreFCMToken, db: Session = Depend
 # a live signaling socket (active_connections) AND are active (is_active = 1). The app uses this to
 # drop both killed peers (socket gone within seconds) and peers who set themselves inactive, from
 # everyone else's nearby list.
-@app.post("/v1/peers_online/", dependencies=[Depends(verify_api_key)])
+@app.post("/v1/peers_online/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)):
     connected = [uid for uid in params.uuids if uid in manager.active_connections]
     if not connected:
@@ -707,7 +765,7 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     return {"online": online}
 
 # Marks friend_uuid as a friend of uuid (inserts a link into user_user). X-API-Key only.
-@app.post("/v1/add_friend/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/add_friend/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def add_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
     try:
         return response_module.add_friend(db, params.uuid, params.friend_uuid)
@@ -717,7 +775,7 @@ async def add_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # Ends the friendship between uuid and friend_uuid (removes the user_user link). X-API-Key only.
-@app.post("/v1/cancel_friend/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/cancel_friend/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def cancel_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
     try:
         return response_module.cancel_friend(db, params.uuid, params.friend_uuid)
@@ -727,7 +785,7 @@ async def cancel_friend(params: RequestAddFriend, db: Session = Depends(get_db))
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # Sets the user's active/inactive flag (is_active). X-API-Key only.
-@app.post("/v1/activate_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/activate_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def activate_user(params: RequestActivateUser, db: Session = Depends(get_db)):
     try:
         return response_module.activate_user(db, params.uuid, params.is_active)
@@ -736,8 +794,28 @@ async def activate_user(params: RequestActivateUser, db: Session = Depends(get_d
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# Vends WebRTC ICE servers: a public STUN plus short-lived TURN credentials derived from the
+# license-issued TURN_SECRET (coturn use-auth-secret REST scheme: username = expiry unix time,
+# credential = base64(HMAC-SHA1(secret, username))). Fetched once per call; STUN-only if TURN
+# isn't configured. X-API-Key only.
+@app.post("/v1/turn_credentials/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def turn_credentials(params: RequestUuid):
+    ice_servers = [{"urls": ["stun:stun.l.google.com:19302"]}]
+    try:
+        secret = license_manager.constants.get("TURN_SECRET", "")
+        urls = license_manager.constants.get("TURN_URLS", [])
+        if secret and urls:
+            ttl = 3600  # credentials valid for 1 hour
+            username = str(int(time.time()) + ttl)
+            digest = hmac.new(secret.encode("utf-8"), username.encode("utf-8"), hashlib.sha1).digest()
+            credential = base64.b64encode(digest).decode("ascii")
+            ice_servers.append({"urls": urls, "username": username, "credential": credential})
+    except Exception as e:
+        print(f"turn_credentials error: {e}")
+    return {"ice_servers": ice_servers}
+
 # Returns all of the user's friends (nearby or not) with their profile + image, as {"friends": [...]}.
-@app.post("/v1/friends/", dependencies=[Depends(verify_api_key)])
+@app.post("/v1/friends/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def get_friends(params: RequestId, db: Session = Depends(get_db)):
     try:
         friends = response_module.get_friends(db, params.uuid)
@@ -752,11 +830,19 @@ async def get_friends(params: RequestId, db: Session = Depends(get_db)):
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# Launch check: tells the app whether the backend still knows this peer uuid. Deliberately does
+# NOT use check_peer_uuid — an unknown peer must get a 200 {"exists": false} (so the app can route
+# to Create Profile) rather than a 403 the client would confuse with a network failure. Existence
+# ignores is_active so an inactive (invisible) user isn't wrongly bounced to onboarding.
+@app.post("/v1/check_peer/", dependencies=[Depends(verify_api_key)])
+async def check_peer(params: RequestUuid, db: Session = Depends(get_db)):
+    return {"exists": response_module.peer_exists(db, params.uuid)}
+
 # Endpoint to look up a peer by its hex uuid. The uuid is supplied in the JSON body
 # ({"uuid": ...}) so the iOS app reuses its standard postRequestForJson helper
 # (X-API-Key, no OAuth), like the other peer calls.
-@app.post("/v1/peer/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
-async def get_peer_post(params: RequestId, db: Session = Depends(get_db)):
+@app.post("/v1/peer/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def get_peer_post(params: RequestPeerLookup, db: Session = Depends(get_db)):
     try:
         response = response_module.get_peer(db, params.uuid)
 
@@ -777,7 +863,7 @@ async def get_peer_post(params: RequestId, db: Session = Depends(get_db)):
 # Endpoint to update an existing peer. The peer is identified by its hex uuid in the
 # JSON body; name, about_me and image_data are all optional so callers can update only
 # the fields they supply (same iOS postRequestForJson helper as the other peer calls).
-@app.post("/v1/update_peer/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/update_peer/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def update_peer(params: RequestUpdatePeer, db: Session = Depends(get_db)):
     message = ""
     result = False
@@ -822,7 +908,7 @@ async def update_peer(params: RequestUpdatePeer, db: Session = Depends(get_db)):
 
 # Endpoint to update only a peer's profile image. The peer is identified by its hex
 # uuid; image_data is the base64 image to store as peer_{uuid_hex}.jpg.
-@app.post("/v1/update_peer_image/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/update_peer_image/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def update_peer_image(params: RequestUpdatePeerImage, db: Session = Depends(get_db)):
     message = ""
     result = False
@@ -866,7 +952,7 @@ async def update_peer_image(params: RequestUpdatePeerImage, db: Session = Depend
         response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
 
 # Endpoint to update only a peer's name. The peer is identified by its hex uuid.
-@app.post("/v1/update_peer_name/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/update_peer_name/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def update_peer_name(params: RequestUpdatePeerName, db: Session = Depends(get_db)):
     message = ""
     result = False
@@ -893,7 +979,7 @@ async def update_peer_name(params: RequestUpdatePeerName, db: Session = Depends(
         response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
 
 # Endpoint to update only a peer's about_me. The peer is identified by its hex uuid.
-@app.post("/v1/update_peer_about_me/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key)])
+@app.post("/v1/update_peer_about_me/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def update_peer_about_me(params: RequestUpdatePeerAboutMe, db: Session = Depends(get_db)):
     message = ""
     result = False
