@@ -11,6 +11,7 @@ import uuid
 import fastapi
 
 from classes.database_class import Database
+from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from functions import response_module # Not from functions.response_module import * because duplicate method name conflicts
 #from constants import Constants
@@ -140,16 +141,129 @@ class LogMiddleware(BaseHTTPMiddleware):
         logging.info(f"Response status: {response.status_code}")
         return response
 
+# Global cap on queued offline control ops (CHAT_EDIT/CHAT_DELETE) across ALL peers. ~each op is a small
+# JSON dict (~a few hundred bytes), so 50k ≈ ~15-20 MB worst case. When full, the oldest op is FIFO-evicted.
+MAX_PENDING_OPS = int(os.environ.get("PEERS_MAX_PENDING_OPS", "50000"))
+# Byte cap on the queued offline messages (photos are large base64) — bounds memory regardless of count.
+# FIFO-evict the oldest until under both caps. Default 100 MB.
+MAX_PENDING_BYTES = int(os.environ.get("PEERS_MAX_PENDING_BYTES", str(100 * 1024 * 1024)))
+
+
+def _op_size(data: dict) -> int:
+    """Rough byte size of a queued op (the big contributor is a photo's/voice's base64 payload)."""
+    return (len(data.get("imageData") or "") + len(data.get("audioData") or "")
+            + len(data.get("contactCard") or "") + len(data.get("text") or "") + 256)
+# Global cap on cached live-location last-positions (one per active share per target). Bounded so a flood
+# of live shares can't grow memory without limit.
+MAX_LIVE_POSITIONS = int(os.environ.get("PEERS_MAX_LIVE_POSITIONS", "20000"))
+
 # Store active connections: bell_id -> WebSocket
 class ConnectionManager:
     def __init__(self):
         # We store connections mapped by a unique ID (e.g., "bell_101", "safe_user_5")
         self.active_connections: Dict[str, WebSocket] = {}
+        # Per-receiver app-icon badge counter for offline friend-message pushes. Incremented on each
+        # such push (carried in aps.badge), reset when the receiver reconnects (back online/foreground).
+        self.pending_badge: Dict[str, int] = {}
+        # Queue of control ops (CHAT_EDIT / CHAT_DELETE) that couldn't be delivered while the target was
+        # offline/killed — flushed when that peer reconnects. In-memory (lost on a backend restart, which
+        # is rare); deletes/edits are eventually-consistent so that's acceptable.
+        #   pending_ops:     seq -> (target_id, op)   — global insertion order (OrderedDict = FIFO)
+        #   pending_by_peer: target_id -> deque(seq)  — per-peer index for O(1) flush
+        # Bounded GLOBALLY at MAX_PENDING_OPS: when full, the OLDEST op is evicted (FIFO), so a flood of
+        # deletes for killed peers can't grow memory without bound / crash the server.
+        self.pending_ops: "OrderedDict[int, tuple]" = OrderedDict()   # seq -> (target_id, data, size)
+        self.pending_by_peer: Dict[str, deque] = {}
+        self._op_seq = 0
+        self._pending_bytes = 0
+        # Live-location last-position cache: target_id -> {msgId -> latest LOCATION_UPDATE data}. Flushed
+        # to the target on reconnect so a backgrounded/returning receiver sees an up-to-date pin.
+        self.live_positions: Dict[str, dict] = {}
+        self._live_count = 0
 
     async def connect(self, client_id: str, websocket: WebSocket):
         await websocket.accept()
         self.active_connections[client_id] = websocket
+        self.pending_badge.pop(client_id, None)   # back online → clear the app-icon badge counter
         print(f"Client connected: {client_id}")
+        # Deliver any control ops queued while this peer was offline (e.g. a Sender deleted a message
+        # while the receiver had the app killed).
+        seqs = self.pending_by_peer.pop(client_id, None)
+        if seqs:
+            ops = []
+            for seq in seqs:
+                entry = self.pending_ops.pop(seq, None)
+                if entry:
+                    self._pending_bytes -= entry[2]
+                    ops.append(entry[1])
+            for op in ops:
+                try:
+                    await websocket.send_json(op)
+                except Exception as e:
+                    print(f"flush pending op to {client_id[:8]} failed: {e}")
+                    break
+            print(f"flushed {len(ops)} queued op(s) to {client_id[:8]}")
+        # Deliver the latest position of any live-location shares aimed at this peer (skip expired).
+        positions = self.live_positions.pop(client_id, None)
+        if positions:
+            self._live_count -= len(positions)
+            now = time.time()
+            for mid, d in positions.items():
+                lu = d.get("liveUntil") or 0
+                if lu and lu < now:
+                    continue
+                try:
+                    await websocket.send_json(d)
+                except Exception as e:
+                    print(f"flush live position to {client_id[:8]} failed: {e}")
+                    break
+            print(f"flushed live position(s) to {client_id[:8]}")
+
+    def cache_live(self, target_id: str, data: dict):
+        mid = data.get("msgId")
+        if not mid:
+            return
+        bucket = self.live_positions.setdefault(target_id, {})
+        if mid not in bucket:
+            if self._live_count >= MAX_LIVE_POSITIONS:
+                return                      # at cap → don't track new shares (best-effort)
+            self._live_count += 1
+        bucket[mid] = data
+
+    def clear_live(self, target_id: str, mid):
+        bucket = self.live_positions.get(target_id)
+        if bucket and mid in bucket:
+            del bucket[mid]
+            self._live_count -= 1
+            if not bucket:
+                self.live_positions.pop(target_id, None)
+
+    def enqueue(self, target_id: str, data: dict):
+        self._op_seq += 1
+        seq = self._op_seq
+        size = _op_size(data)
+        self.pending_ops[seq] = (target_id, data, size)
+        self.pending_by_peer.setdefault(target_id, deque()).append(seq)
+        self._pending_bytes += size
+        # FIFO eviction when over EITHER the count or the byte cap → drop the oldest queued op(s).
+        while len(self.pending_ops) > MAX_PENDING_OPS or self._pending_bytes > MAX_PENDING_BYTES:
+            if not self.pending_ops:
+                break
+            old_seq, (old_target, _, old_size) = self.pending_ops.popitem(last=False)
+            self._pending_bytes -= old_size
+            dq = self.pending_by_peer.get(old_target)
+            if dq:
+                if dq and dq[0] == old_seq:    # the evicted op is that peer's oldest
+                    dq.popleft()
+                else:
+                    try: dq.remove(old_seq)
+                    except ValueError: pass
+                if not dq:
+                    self.pending_by_peer.pop(old_target, None)
+
+    def next_badge(self, client_id: str) -> int:
+        self.pending_badge[client_id] = self.pending_badge.get(client_id, 0) + 1
+        return self.pending_badge[client_id]
 
     def disconnect(self, client_id: str):
         if client_id in self.active_connections:
@@ -188,6 +302,34 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 msg_type = data.get("type")
                 print(f"relay {client_id} → {target_id}: {msg_type}")
 
+                # Cache live-location position (delivered or not) so a reconnecting receiver gets the
+                # latest pin; clear it when the share stops.
+                if msg_type == "LOCATION_UPDATE":
+                    manager.cache_live(target_id, data)
+                elif msg_type == "LOCATION_STOP":
+                    manager.clear_live(target_id, data.get("msgId"))
+
+                # A photo / contact / (static) location message can't have its payload carried by the
+                # offline push. ALWAYS queue it for friends (independent of the live send below — a killed
+                # app can leave a stale socket that accepts the write, so "delivered" isn't reliable). The
+                # receiver de-dups by msgId, so an online receiver that already got it ignores the flush.
+                # The queue is byte-bounded (MAX_PENDING_BYTES), so queued photos can't exhaust memory.
+                if (msg_type == "CHAT_MESSAGE" and not data.get("liveUntil")
+                        and (data.get("contactCard") or data.get("imageData") or data.get("audioData")
+                             or data.get("latitude") is not None)):
+                    try:
+                        s_q = database.create_session()
+                        try:
+                            if response_module.are_friends(s_q, client_id, target_id):
+                                manager.enqueue(target_id, data)
+                                kind = ("photo" if data.get("imageData") else "audio" if data.get("audioData")
+                                        else "contact" if data.get("contactCard") else "location")
+                                print(f"relay: queued {kind} for {target_id[:8]}")
+                        finally:
+                            s_q.close()
+                    except Exception as e:
+                        print(f"relay queue media error: {e}")
+
                 # Try a live delivery first. A killed app may leave a stale socket in
                 # active_connections (its disconnect not yet detected); sending into it raises,
                 # so we drop it and fall through to the FCM push instead of silently losing the
@@ -203,9 +345,34 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         manager.disconnect(target_id)
 
                 if not delivered:
+                    # A friend's chat message to an offline/backgrounded peer → VISIBLE "new message"
+                    # push: banner (title=sender, body=text) + system sound + app-icon badge, carrying
+                    # the text + msgId so the app stores it (de-dup). Only between friends (a non-friend
+                    # chat uses the accept-dialog flow and never silently messages an offline peer).
+                    if msg_type == "CHAT_MESSAGE":
+                        try:
+                            s = database.create_session()
+                            try:
+                                if response_module.are_friends(s, client_id, target_id):
+                                    fcm_token, _, _ = response_module.get_peer_push_info(s, target_id)
+                                    _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
+                                    if fcm_token:
+                                        badge = manager.next_badge(target_id)
+                                        ok = response_module.send_chat_message_push(
+                                            fcm_token, client_id, sender_name,
+                                            data.get("text") or "", badge, data.get("msgId") or "")
+                                        print(f"relay: chat-msg push to {target_id[:8]} sent={ok} badge={badge}")
+                                    else:
+                                        print(f"relay: offline friend {target_id[:8]} has no push token")
+                                else:
+                                    print(f"relay: CHAT_MESSAGE to offline non-friend {target_id[:8]} dropped")
+                            finally:
+                                s.close()
+                        except Exception as e:
+                            print(f"relay chat-msg push error: {e}")
                     # Signal types that warrant a push when the target is offline
                     # (backgrounded/killed): chat request, call request + the friend handshake.
-                    if msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND"):
+                    elif msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND"):
                         try:
                             s = database.create_session()
                             try:
@@ -235,6 +402,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 s.close()
                         except Exception as e:
                             print(f"relay FCM fallback error: {e}")
+                    elif msg_type in ("CHAT_EDIT", "CHAT_DELETE"):
+                        # Hold the edit/delete and deliver it when the (killed/offline) target returns,
+                        # so the Sender's edit/delete still applies at the Receiver's end. `data` already
+                        # has the sender stamped, so the flushed op is processed exactly like a live one.
+                        manager.enqueue(target_id, data)
+                        print(f"relay: queued {msg_type} for offline {target_id[:8]}")
                     else:
                         print(f"relay: target {target_id[:8]} offline; dropping {msg_type}")
 

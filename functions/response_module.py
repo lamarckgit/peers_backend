@@ -753,6 +753,48 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
     return data, android_config, apns_config
 
 
+def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str, text: str, badge: int, msg_id: str = "") -> bool:
+    """Visible 'new message' push for a FRIEND's chat message to an offline/backgrounded peer:
+      • aps.alert (title = sender name, body = the message text) → a real banner on the lock screen
+        / a notification while the receiver is in another app,
+      • sound="default" so the receiver's system sound (or silence, per their settings/Focus) plays,
+      • badge=<count> so the app icon shows the standard new-message count (set by the OS even while
+        force-quit),
+      • content_available=True so a merely-suspended app is woken to store the message in the
+        background (so it's already in the transcript, not just the banner),
+      • text + msg_id in `data` so the app stores the message and de-dups (a suspended app may process
+        the push in the background AND again on tap). action=NEW_MESSAGE → tap opens the chat.
+    False (no raise) on not-configured / empty-token / error."""
+    if app_peers is None:
+        print("send_chat_message_push: PEERS.CLUB Firebase app not configured — push skipped.")
+        return False
+    if not target_token:
+        return False
+    name = sender_name or "A peer"
+    body = text or "New message"
+    data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
+            "text": text or "", "msg_id": msg_id or ""}
+    aps_object = messaging.Aps(
+        alert=messaging.ApsAlert(title=name, body=body),
+        sound="default",
+        badge=badge,
+        content_available=True,
+    )
+    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    apns_config = messaging.APNSConfig(
+        headers={"apns-priority": "10", "apns-push-type": "alert"},
+        payload=messaging.APNSPayload(aps=aps_object),
+    )
+    try:
+        message = messaging.Message(token=target_token, data=data, android=android_config, apns=apns_config)
+        response = messaging.send(message, app=app_peers)
+        print(f"send_chat_message_push: from {sender_hex[:8]} badge={badge} → {response}")
+        return True
+    except Exception as e:
+        print(f"send_chat_message_push error [{type(e).__name__}]: {e}")
+        return False
+
+
 def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None) -> bool:
     """Pushes a signaling event (chat / friend / call) to ONE backgrounded/killed peer via the
     PEERS.CLUB Firebase app. Payload is built by _build_signal_payload (mirrors the SafeXS doorbell
