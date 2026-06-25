@@ -1161,6 +1161,35 @@ def filter_active_peers(db: Session, peer_hexes):
             active.append(peer_hex)
     return active
 
+def active_status(db: Session, peer_hexes):
+    """ONE round-trip: returns {hex_uuid: bool(is_active)} for the queried peers that exist. Lets
+    peers_online derive BOTH `online` (connected AND active) and `inactive` (is_active=0) from a single
+    query instead of a per-id SELECT each — so a presence poll touches the DB once, not 2×N times. Uses
+    explicit named placeholders (the BLE-nearby group is small) for portability across SQLAlchemy/drivers."""
+    by_uuid = {}
+    for peer_hex in peer_hexes:
+        try:
+            b = bytes.fromhex(peer_hex)
+        except (ValueError, TypeError):
+            continue
+        if len(b) == 16:
+            by_uuid[b] = peer_hex
+    if not by_uuid:
+        return {}
+    keys = list(by_uuid.keys())
+    placeholders = ", ".join(f":u{i}" for i in range(len(keys)))
+    bind = {f"u{i}": k for i, k in enumerate(keys)}
+    rows = db.execute(
+        text(f"SELECT uuid, is_active FROM user WHERE uuid IN ({placeholders})"),
+        bind,
+    ).mappings().all()
+    status = {}
+    for row in rows:
+        key = bytes(row["uuid"])            # normalise (driver may hand back bytearray/memoryview)
+        if key in by_uuid:
+            status[by_uuid[key]] = bool(row["is_active"])
+    return status
+
 def activate_user(db: Session, user_hex: str, is_active: bool):
     """Sets a peer's is_active flag. X-API-Key only. Deliberately does NOT filter on is_active in
     the WHERE clause so an already-inactive user can re-activate themselves.

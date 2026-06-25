@@ -958,13 +958,17 @@ async def register_peer_voip_token(params: RequestStoreVoipToken, db: Session = 
 @app.post("/v1/peers_online/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)):
     connected = [uid for uid in params.uuids if uid in manager.active_connections]
-    if not connected:
-        return {"online": []}
-    online = response_module.filter_active_peers(db, connected)
-    # Drop peers this caller has blocked (or who blocked them) so they vanish from the nearby list.
-    blocked = response_module.blocked_peer_set(db, params.uuid, online)
-    online = [u for u in online if u not in blocked]
-    return {"online": online}
+    # Single query → is_active for every queried peer. `online` = connected AND active; `inactive` =
+    # is_active=0 (reported separately so the app keeps a backgrounded-but-active peer that's still nearby
+    # while dropping a genuinely-inactive one even in BLE range).
+    status = response_module.active_status(db, params.uuids)
+    inactive = [h for h, active in status.items() if not active]
+    online = [u for u in connected if status.get(u, False)]
+    if online:
+        # Drop peers this caller has blocked (or who blocked them) so they vanish from the nearby list.
+        blocked = response_module.blocked_peer_set(db, params.uuid, online)
+        online = [u for u in online if u not in blocked]
+    return {"online": online, "inactive": inactive}
 
 # Permanently blocks a peer for this user: marks (or creates) their user_user link is_active = 0, so
 # the combination disappears from nearby + friends and can no longer wake either side. X-API-Key only.
