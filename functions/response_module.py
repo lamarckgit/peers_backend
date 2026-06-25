@@ -836,7 +836,11 @@ def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_n
 # team (3V394W95NG) and its APNs key (6XMZLTFG8H). VERIFY the Key ID matches the .p8 you deploy: if
 # your peers-club .p8 is a DIFFERENT key than the SafeXS-team one, put ITS Key ID here.
 # ---------------------------------------------------------------------------------------------
-APNS_AUTH_KEY_PATH = os.environ.get("APNS_AUTH_KEY_PATH", "AuthKeyPeersClub.p8")
+# Resolve the .p8 relative to the backend root (where main.py lives), NOT the process CWD. A bare
+# relative "AuthKeyPeersClub.p8" silently breaks (FileNotFoundError → VoIP push fails → calls fall back to
+# FCM and become unstable) whenever uvicorn is launched from a different working directory after a redeploy.
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APNS_AUTH_KEY_PATH = os.environ.get("APNS_AUTH_KEY_PATH", os.path.join(_BACKEND_ROOT, "AuthKeyPeersClub.p8"))
 APNS_KEY_ID = os.environ.get("APNS_KEY_ID", "M2RKXMS874") #6XMZLTFG8H
 APNS_TEAM_ID = os.environ.get("APNS_TEAM_ID", "3V394W95NG")
 APNS_VOIP_TOPIC = os.environ.get("APNS_VOIP_TOPIC", "club.peers.ios.voip")
