@@ -23,7 +23,7 @@ from fastapi import BackgroundTasks
 from fastapi.responses import FileResponse
 from license_manager import LicenseManager
 from logging.handlers import TimedRotatingFileHandler
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import HTMLResponse
@@ -49,6 +49,11 @@ PROFILE_DIR = "static/profile_images"
 os.makedirs(PROFILE_DIR, exist_ok=True)
 SNAPSHOT_DIR = "static/snapshots"
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+# Additional "about me" profile images: stored as <uuid>-<seq>.jpg; their display order + the in-use
+# sequence numbers live in the user.image_order column. MAX mirrors the app's 5 "about me" slots.
+ADDITIONAL_DIR = "static/additional_images"
+os.makedirs(ADDITIONAL_DIR, exist_ok=True)
+MAX_ADDITIONAL_IMAGES = 5
 # Doorbell snapshots are never deleted by the request path; clean them up
 # in-process so a customer deployment is self-contained (no external cron/timer).
 SNAPSHOT_RETENTION_DAYS = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "14"))
@@ -442,18 +447,25 @@ async def health():
         },
     )
 
+# "About me" is limited to 256 USER-PERCEIVED characters on the client (grapheme clusters, so an emoji or
+# flag counts as 1). One such grapheme can expand to several Unicode code points (a flag = 2, a ZWJ family
+# = 7, etc.), and both this code-point cap and the DB column count code points — so the budget is 256 × a
+# generous per-grapheme factor. 2048 covers 256 of even the heaviest common emoji; it bounds abuse without
+# rejecting any sane bio. KEEP THIS IN SYNC WITH THE about_me COLUMN WIDTH (see migration note).
+ABOUT_ME_MAX_CODEPOINTS = 2048
+
 class RequestUuid(BaseModel):
     uuid: str
 
 class RequestCreatePeer(BaseModel):
     name: str
-    about_me: Optional[str] = None
+    about_me: Optional[str] = Field(default=None, max_length=ABOUT_ME_MAX_CODEPOINTS)
     image_data: Optional[str] = None
 
 class RequestUpdatePeer(BaseModel):
     uuid: str
     name: Optional[str] = None
-    about_me: Optional[str] = None
+    about_me: Optional[str] = Field(default=None, max_length=ABOUT_ME_MAX_CODEPOINTS)
     image_data: Optional[str] = None
 
 class RequestUpdatePeerImage(BaseModel):
@@ -466,7 +478,30 @@ class RequestUpdatePeerName(BaseModel):
 
 class RequestUpdatePeerAboutMe(BaseModel):
     uuid: str
-    about_me: str
+    about_me: str = Field(max_length=ABOUT_ME_MAX_CODEPOINTS)
+
+# --- Additional "about me" images ---
+class RequestAddImage(BaseModel):
+    uuid: str
+    image_data: str
+    order_no: int = 0            # display position to insert the new photo at (the app appends → end)
+
+class RequestUpdateImage(BaseModel):
+    uuid: str
+    image_data: str
+    order_no: int               # display position whose photo is being replaced
+
+class RequestUpdateImageOrder(BaseModel):
+    uuid: str
+    new_order: str              # new display order as 0-based OLD positions, e.g. "2,0,1,3,4"
+
+class RequestDeleteImage(BaseModel):
+    uuid: str
+    order_no: int               # display position to clear
+
+class RequestPeerImages(BaseModel):
+    uuid: str                   # the peer whose additional images are requested
+    caller_uuid: str            # the authenticated requester (validates via check_peer_uuid)
 
 class RequestPeersOnline(BaseModel):
     uuid: str          # the calling peer's own uuid (authenticated by check_peer_uuid)
@@ -1186,6 +1221,95 @@ async def update_peer_image(params: RequestUpdatePeerImage, db: Session = Depend
         message = message.replace("Exception error: ", "")
         # No peripheral involved in a peer update; log against the peer's hex uuid.
         response_module.log_online_action(db, "", peer_hex, 0, result, "", -1, message)
+
+# --- Additional "about me" images -------------------------------------------------------------------
+# Stored as static/additional_images/<uuid>-<seq>.jpg; user.image_order holds the in-use sequence numbers
+# in display order (comma-separated). A new photo's seq = max(image_order)+1 (0 when empty), so a filename
+# is never reused while still referenced. All POST; the modifying ones authenticate the owner via `uuid`,
+# peer_images authenticates the requester via `caller_uuid`.
+
+def _additional_image_path(peer_hex: str, seq: int) -> str:
+    return os.path.join(ADDITIONAL_DIR, f"{peer_hex}-{seq}.jpg")
+
+@app.post("/v1/add_image/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def add_image(params: RequestAddImage, db: Session = Depends(get_db)):
+    peer_hex = params.uuid
+    try:
+        order = response_module.get_image_order(db, peer_hex)
+        if len(order) >= MAX_ADDITIONAL_IMAGES:
+            return JSONResponse(content={"success": False, "error": "Image limit reached"}, status_code=400)
+        new_seq = (max(order) + 1) if order else 0
+        with open(_additional_image_path(peer_hex, new_seq), "wb") as f:
+            f.write(base64.b64decode(params.image_data))
+        pos = max(0, min(params.order_no, len(order)))
+        order.insert(pos, new_seq)
+        response_module.set_image_order(db, peer_hex, order)
+        return {"success": True, "order": order, "seq": new_seq, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/update_image/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def update_image(params: RequestUpdateImage, db: Session = Depends(get_db)):
+    peer_hex = params.uuid
+    try:
+        order = response_module.get_image_order(db, peer_hex)
+        if params.order_no < 0 or params.order_no >= len(order):
+            return JSONResponse(content={"success": False, "error": "Invalid order_no"}, status_code=400)
+        seq = order[params.order_no]
+        with open(_additional_image_path(peer_hex, seq), "wb") as f:
+            f.write(base64.b64decode(params.image_data))
+        return {"success": True, "order": order, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/update_image_order/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def update_image_order(params: RequestUpdateImageOrder, db: Session = Depends(get_db)):
+    peer_hex = params.uuid
+    try:
+        order = response_module.get_image_order(db, peer_hex)
+        try:
+            positions = [int(p) for p in params.new_order.split(",") if p.strip() != ""]
+        except ValueError:
+            return JSONResponse(content={"success": False, "error": "Invalid order string"}, status_code=400)
+        # Must be a permutation of the current positions (0…N-1) — reorder, never add/drop.
+        if sorted(positions) != list(range(len(order))):
+            return JSONResponse(content={"success": False, "error": "Order must be a permutation of current positions"}, status_code=400)
+        new_order = [order[p] for p in positions]
+        response_module.set_image_order(db, peer_hex, new_order)
+        return {"success": True, "order": new_order, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/delete_image/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def delete_image(params: RequestDeleteImage, db: Session = Depends(get_db)):
+    peer_hex = params.uuid
+    try:
+        order = response_module.get_image_order(db, peer_hex)
+        if params.order_no < 0 or params.order_no >= len(order):
+            return JSONResponse(content={"success": False, "error": "Invalid order_no"}, status_code=400)
+        seq = order.pop(params.order_no)
+        path = _additional_image_path(peer_hex, seq)
+        if os.path.exists(path):
+            os.remove(path)
+        response_module.set_image_order(db, peer_hex, order)
+        return {"success": True, "order": order, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/peer_images/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def peer_images(params: RequestPeerImages, db: Session = Depends(get_db)):
+    peer_hex = params.uuid
+    try:
+        order = response_module.get_image_order(db, peer_hex)
+        images = []
+        for seq in order:
+            path = _additional_image_path(peer_hex, seq)
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    images.append(base64.b64encode(f.read()).decode("ascii"))
+        return {"success": True, "images": images, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
 
 # Endpoint to update only a peer's name. The peer is identified by its hex uuid.
 @app.post("/v1/update_peer_name/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])

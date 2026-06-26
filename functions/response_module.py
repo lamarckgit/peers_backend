@@ -574,6 +574,40 @@ def update_peer(db: Session, peer_hex: str, name: str = None, about_me: str = No
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
+def _peer_uuid_bytes(peer_hex: str) -> bytes:
+    """The ASCII hex string from the API → the raw 16-byte `uuid` column value."""
+    try:
+        peer_uuid = bytes.fromhex(peer_hex)
+    except (ValueError, TypeError):
+        raise Exception("Invalid peer uuid")
+    if len(peer_uuid) != 16:
+        raise Exception("Invalid peer uuid")
+    return peer_uuid
+
+def get_image_order(db: Session, peer_hex: str) -> list:
+    """Read a peer's image_order — the comma-separated additional-image sequence numbers, in display order."""
+    peer_uuid = _peer_uuid_bytes(peer_hex)
+    row = db.execute(
+        text("SELECT image_order FROM user WHERE uuid = :uuid AND is_active = 1"),
+        {"uuid": peer_uuid},
+    ).mappings().fetchone()
+    if not row:
+        raise Exception("Peer not found")
+    raw = (row["image_order"] or "").strip()
+    if not raw:
+        return []
+    return [int(part) for part in raw.split(",") if part.strip() != ""]
+
+def set_image_order(db: Session, peer_hex: str, order: list) -> None:
+    """Persist a peer's image_order list as a comma-separated string."""
+    peer_uuid = _peer_uuid_bytes(peer_hex)
+    value = ",".join(str(int(n)) for n in order)
+    db.execute(
+        text("UPDATE user SET image_order = :order WHERE uuid = :uuid AND is_active = 1"),
+        {"order": value, "uuid": peer_uuid},
+    )
+    db.commit()
+
 def get_peer(db: Session, peer_hex: str):
     try:
         # The ASCII hex string from the API maps back to the raw 16-byte `uuid` column.
