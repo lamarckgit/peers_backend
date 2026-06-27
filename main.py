@@ -54,6 +54,12 @@ os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 ADDITIONAL_DIR = "static/additional_images"
 os.makedirs(ADDITIONAL_DIR, exist_ok=True)
 MAX_ADDITIONAL_IMAGES = 5
+# Chat media too large for the WebSocket (videos, later documents) is uploaded here as <media_id>.<ext>
+# and referenced by id in the chat message; the receiver fetches it on (re)launch — persistent, so a
+# killed receiver still gets it. The profile video lives next to the profile image in PROFILE_DIR
+# (<uuid>-video.mp4), one per peer.
+CHAT_MEDIA_DIR = "static/chat_media"
+os.makedirs(CHAT_MEDIA_DIR, exist_ok=True)
 # Doorbell snapshots are never deleted by the request path; clean them up
 # in-process so a customer deployment is self-contained (no external cron/timer).
 SNAPSHOT_RETENTION_DAYS = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "14"))
@@ -502,6 +508,34 @@ class RequestDeleteImage(BaseModel):
 class RequestPeerImages(BaseModel):
     uuid: str                   # the peer whose additional images are requested
     caller_uuid: str            # the authenticated requester (validates via check_peer_uuid)
+
+# --- Video media (uploaded to a file, referenced by id; too large for the WebSocket) ---
+class RequestUploadChatVideo(BaseModel):
+    uuid: str                   # the sender (authenticated)
+    video_data: str             # base64 mp4
+    cover_data: str = ""        # base64 jpg poster (mid-clip still); optional
+
+class RequestGetChatVideo(BaseModel):
+    media_id: str               # the id returned by upload_chat_video
+    caller_uuid: str            # the authenticated requester
+
+class RequestDeleteChatVideo(BaseModel):
+    media_id: str               # the id whose file (+ poster) to delete
+    uuid: str                   # the authenticated caller (the sender deleting their own message)
+
+# A profile VIDEO is just another "about me" item in image_order: stored as <uuid>-<seq>.mp4 with a poster
+# at <uuid>-<seq>.jpg. It reorders/deletes through the same image endpoints as a photo.
+class RequestAddProfileVideo(BaseModel):
+    uuid: str                   # the owner (authenticated)
+    video_data: str             # base64 mp4
+    cover_data: str             # base64 jpg poster (mid-clip still)
+    order_no: int = 0           # insert position (add) OR the position to overwrite (replace)
+    replace: bool = False       # True → replace the item already at order_no (photo→video, same slot)
+
+class RequestGetAdditionalVideo(BaseModel):
+    uuid: str                   # the peer whose item is requested
+    order_no: int               # position in image_order
+    caller_uuid: str            # the authenticated requester
 
 class RequestPeersOnline(BaseModel):
     uuid: str          # the calling peer's own uuid (authenticated by check_peer_uuid)
@@ -957,6 +991,16 @@ async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
                 os.remove(file_path)
             except OSError as e:
                 print(f"delete_peer: failed to remove image {file_path}: {e}")
+        # Remove ALL additional "about me" items — extra photos AND the profile video (+ its poster), stored
+        # as <uuid>-<seq>.jpg / <uuid>-<seq>.mp4. (uuids are fixed 32-hex, so the "<uuid>-" prefix is exact.)
+        if _is_hex32(params.uuid):
+            prefix = f"{params.uuid}-"
+            for name in os.listdir(ADDITIONAL_DIR):
+                if name.startswith(prefix):
+                    try:
+                        os.remove(os.path.join(ADDITIONAL_DIR, name))
+                    except OSError as e:
+                        print(f"delete_peer: failed to remove additional file {name}: {e}")
         return result
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
@@ -1231,6 +1275,11 @@ async def update_peer_image(params: RequestUpdatePeerImage, db: Session = Depend
 def _additional_image_path(peer_hex: str, seq: int) -> str:
     return os.path.join(ADDITIONAL_DIR, f"{peer_hex}-{seq}.jpg")
 
+def _additional_video_path(peer_hex: str, seq: int) -> str:
+    # A video item: <uuid>-<seq>.mp4 alongside its poster <uuid>-<seq>.jpg (so the existing .jpg readers
+    # transparently return the poster for a video item).
+    return os.path.join(ADDITIONAL_DIR, f"{peer_hex}-{seq}.mp4")
+
 @app.post("/v1/add_image/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def add_image(params: RequestAddImage, db: Session = Depends(get_db)):
     peer_hex = params.uuid
@@ -1258,6 +1307,9 @@ async def update_image(params: RequestUpdateImage, db: Session = Depends(get_db)
         seq = order[params.order_no]
         with open(_additional_image_path(peer_hex, seq), "wb") as f:
             f.write(base64.b64decode(params.image_data))
+        # Replacing a VIDEO item with a photo → drop its .mp4 so it's no longer a video.
+        if os.path.exists(_additional_video_path(peer_hex, seq)):
+            os.remove(_additional_video_path(peer_hex, seq))
         return {"success": True, "order": order, "error": ""}
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
@@ -1288,9 +1340,9 @@ async def delete_image(params: RequestDeleteImage, db: Session = Depends(get_db)
         if params.order_no < 0 or params.order_no >= len(order):
             return JSONResponse(content={"success": False, "error": "Invalid order_no"}, status_code=400)
         seq = order.pop(params.order_no)
-        path = _additional_image_path(peer_hex, seq)
-        if os.path.exists(path):
-            os.remove(path)
+        for path in (_additional_image_path(peer_hex, seq), _additional_video_path(peer_hex, seq)):
+            if os.path.exists(path):          # .jpg always; .mp4 only when the item was a video
+                os.remove(path)
         response_module.set_image_order(db, peer_hex, order)
         return {"success": True, "order": order, "error": ""}
     except Exception as e:
@@ -1301,15 +1353,127 @@ async def peer_images(params: RequestPeerImages, db: Session = Depends(get_db)):
     peer_hex = params.uuid
     try:
         order = response_module.get_image_order(db, peer_hex)
-        images = []
+        images, is_video = [], []
         for seq in order:
-            path = _additional_image_path(peer_hex, seq)
+            path = _additional_image_path(peer_hex, seq)   # image, or a video item's poster
             if os.path.exists(path):
                 with open(path, "rb") as f:
                     images.append(base64.b64encode(f.read()).decode("ascii"))
-        return {"success": True, "images": images, "error": ""}
+                is_video.append(os.path.exists(_additional_video_path(peer_hex, seq)))
+        return {"success": True, "images": images, "is_video": is_video, "error": ""}
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/add_profile_video/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def add_profile_video(params: RequestAddProfileVideo, db: Session = Depends(get_db)):
+    peer_hex = params.uuid
+    try:
+        order = response_module.get_image_order(db, peer_hex)
+        # Replace the item already at this position (photo → video, keeping its seq + order slot).
+        if params.replace and 0 <= params.order_no < len(order):
+            seq = order[params.order_no]
+            if os.path.exists(_additional_image_path(peer_hex, seq)):
+                os.remove(_additional_image_path(peer_hex, seq))   # old photo / old poster
+            with open(_additional_video_path(peer_hex, seq), "wb") as f:
+                f.write(base64.b64decode(params.video_data))
+            with open(_additional_image_path(peer_hex, seq), "wb") as f:    # new poster
+                f.write(base64.b64decode(params.cover_data))
+            return {"success": True, "order": order, "seq": seq, "error": ""}
+        # Otherwise insert a new item.
+        if len(order) >= MAX_ADDITIONAL_IMAGES:
+            return JSONResponse(content={"success": False, "error": "Image limit reached"}, status_code=400)
+        new_seq = (max(order) + 1) if order else 0
+        with open(_additional_video_path(peer_hex, new_seq), "wb") as f:
+            f.write(base64.b64decode(params.video_data))
+        with open(_additional_image_path(peer_hex, new_seq), "wb") as f:    # poster
+            f.write(base64.b64decode(params.cover_data))
+        pos = max(0, min(params.order_no, len(order)))
+        order.insert(pos, new_seq)
+        response_module.set_image_order(db, peer_hex, order)
+        return {"success": True, "order": order, "seq": new_seq, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/get_additional_video/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def get_additional_video(params: RequestGetAdditionalVideo, db: Session = Depends(get_db)):
+    peer_hex = params.uuid
+    try:
+        order = response_module.get_image_order(db, peer_hex)
+        if params.order_no < 0 or params.order_no >= len(order):
+            return JSONResponse(content={"success": False, "error": "Invalid order_no"}, status_code=400)
+        path = _additional_video_path(peer_hex, order[params.order_no])
+        if not os.path.exists(path):
+            return JSONResponse(content={"success": False, "error": "Not a video"}, status_code=404)
+        with open(path, "rb") as f:
+            return {"success": True, "video_data": base64.b64encode(f.read()).decode("ascii"), "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+# --- Video media -----------------------------------------------------------------------------------
+# Option (B): videos are uploaded to a file and referenced by id in the chat message, so a killed/offline
+# receiver still gets them on (re)launch (the file persists; nothing ages out of the in-memory queue).
+# Chat videos: static/chat_media/<media_id>.mp4 (referenced by id in a chat message).
+
+def _is_hex32(s: str) -> bool:
+    return len(s) == 32 and all(c in "0123456789abcdef" for c in s)
+
+@app.post("/v1/upload_chat_video/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def upload_chat_video(params: RequestUploadChatVideo, db: Session = Depends(get_db)):
+    try:
+        media_id = uuid.uuid4().hex
+        with open(os.path.join(CHAT_MEDIA_DIR, f"{media_id}.mp4"), "wb") as f:
+            f.write(base64.b64decode(params.video_data))
+        # Poster still stored next to the video as <media_id>.jpg (shown before the full download).
+        if params.cover_data:
+            with open(os.path.join(CHAT_MEDIA_DIR, f"{media_id}.jpg"), "wb") as f:
+                f.write(base64.b64decode(params.cover_data))
+        return {"success": True, "media_id": media_id, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/get_chat_video/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def get_chat_video(params: RequestGetChatVideo, db: Session = Depends(get_db)):
+    try:
+        mid = params.media_id
+        if not _is_hex32(mid):
+            return JSONResponse(content={"success": False, "error": "Invalid media id"}, status_code=400)
+        path = os.path.join(CHAT_MEDIA_DIR, f"{mid}.mp4")
+        if not os.path.exists(path):
+            return JSONResponse(content={"success": False, "error": "Not found"}, status_code=404)
+        with open(path, "rb") as f:
+            return {"success": True, "video_data": base64.b64encode(f.read()).decode("ascii"), "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+# NOTE: only the X-API-Key gate — NOT check_peer_uuid. The 32-char random media_id is the secret that
+# authorizes deletion (only chat participants ever learn it), and this must still work while the caller's
+# account is being deleted ("Delete me as Peer" purges chats + the user row concurrently).
+@app.post("/v1/delete_chat_video/", dependencies=[Depends(verify_api_key)])
+async def delete_chat_video(params: RequestDeleteChatVideo, db: Session = Depends(get_db)):
+    try:
+        mid = params.media_id
+        if not _is_hex32(mid):
+            return JSONResponse(content={"success": False, "error": "Invalid media id"}, status_code=400)
+        for path in (os.path.join(CHAT_MEDIA_DIR, f"{mid}.mp4"), os.path.join(CHAT_MEDIA_DIR, f"{mid}.jpg")):
+            if os.path.exists(path):
+                os.remove(path)
+        return {"success": True, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/get_chat_video_cover/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def get_chat_video_cover(params: RequestGetChatVideo, db: Session = Depends(get_db)):
+    try:
+        mid = params.media_id
+        path = os.path.join(CHAT_MEDIA_DIR, f"{mid}.jpg")
+        if not _is_hex32(mid) or not os.path.exists(path):
+            return {"success": True, "cover_data": "", "error": ""}   # no poster → empty, not an error
+        with open(path, "rb") as f:
+            return {"success": True, "cover_data": base64.b64encode(f.read()).decode("ascii"), "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+# (Profile videos now live in image_order as additional items — see add_profile_video / get_additional_video.)
 
 # Endpoint to update only a peer's name. The peer is identified by its hex uuid.
 @app.post("/v1/update_peer_name/", response_model=response_module.ResponsePeer, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
