@@ -175,44 +175,6 @@ def get_nearby_properties(db: Session, ble_id, phone_uuid, constants: dict):
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
-# def get_nearby_properties(db: Session, ble_id, phone_uuid, constants: dict):
-#     query = text("""
-#     SELECT p.name, p.location, p.sig_duration, p.auto_unlock_db, p.totp_secret, p.seed, ph.uuid,
-#     up.auto_unlock, up.offline_support, up.offline_support_from, up.offline_support_to, up.is_admin, u.is_super_admin
-#     FROM user u
-#     LEFT JOIN user_peripheral up ON u.uuid = up.user_id
-#     LEFT JOIN phone_peripheral pp ON u.phone_uuid = pp.phone_uuid AND up.peripheral_ble_id = pp.peripheral_ble_id
-#     LEFT JOIN phone ph ON ph.uuid = u.phone_uuid
-#     LEFT JOIN peripheral p ON up.peripheral_ble_id = p.ble_id
-#     WHERE u.phone_uuid = :phone_uuid
-#     AND pp.peripheral_ble_id = :ble_id
-#     AND (up.is_active = 1 AND p.is_active = 1
-#         AND ((up.valid_from <= NOW() OR up.valid_from IS NULL) AND (NOW() <= up.valid_to OR up.valid_to IS NULL)
-#         OR up.is_admin = 1))
-#     """)
-#     try:
-#         result = db.execute(query, {"phone_uuid": phone_uuid.upper(), "ble_id": ble_id}).mappings().fetchone()
-#         open_online_cmd = ""  # crypto_client.encrypt(open_online_cmd) This has been implemented as a separate request see "open_online"
-#         if result:
-#             open_offline_cmd = get_offline_payload(result["offline_support"], result["offline_support_from"], result["offline_support_to"], result["uuid"], result["sig_duration"], result["seed"], result["totp_secret"], constants)
-#             # Return response
-#             response = ResponseBLE(phone_id=phone_uuid, ble_id=ble_id, name=result["name"], location=result["location"], auto_unlock_db=result["auto_unlock_db"],
-#                   auto_unlock=result["auto_unlock"], offline_support=result["offline_support"],
-#                   is_admin=result["is_admin"], is_super_admin=result["is_super_admin"],
-#                   payload=open_online_cmd, payload_offline=open_offline_cmd, seed=result["seed"],
-#                   totp_secret=result["totp_secret"], public_key="")
-#         else:
-#             # Return empty response if no data found
-#             response = ResponseBLE(phone_id=phone_uuid, ble_id=ble_id, name="", location="", auto_unlock_db=-30, auto_unlock=False, offline_support=False, is_admin=False, is_super_admin=False, payload="", payload_offline="", seed="", totp_secret="", public_key="")
-#
-#         return response
-#
-#     except ValueError as e:
-#         raise ValueError(f"Invalid date format: {e}")
-#     except SQLAlchemyError as e:
-#         raise RuntimeError(f"Database error: {str(e)}")
-#     except Exception as e:
-#         raise Exception(f"Exception error: {str(e)}")
 
 def safe_datetime(dt):
     if isinstance(dt, datetime):
@@ -548,7 +510,7 @@ def update_peer(db: Session, peer_hex: str, name: str = None, about_me: str = No
 
         set_clause = ", ".join(f"{column} = :{column}" for column in fields)
         update_query = text(f"""
-        UPDATE user SET {set_clause} WHERE uuid = :uuid AND is_active = 1
+        UPDATE user SET {set_clause} WHERE uuid = :uuid
         """)
         result = db.execute(update_query, {**fields, "uuid": peer_uuid})
         db.commit()
@@ -557,7 +519,7 @@ def update_peer(db: Session, peer_hex: str, name: str = None, about_me: str = No
 
         # Return the current values so the caller reflects the stored row.
         select_query = text("""
-        SELECT name, about_me FROM user WHERE uuid = :uuid AND is_active = 1
+        SELECT name, about_me FROM user WHERE uuid = :uuid
         """)
         row = db.execute(select_query, {"uuid": peer_uuid}).mappings().fetchone()
 
@@ -588,7 +550,7 @@ def get_image_order(db: Session, peer_hex: str) -> list:
     """Read a peer's image_order — the comma-separated additional-image sequence numbers, in display order."""
     peer_uuid = _peer_uuid_bytes(peer_hex)
     row = db.execute(
-        text("SELECT image_order FROM user WHERE uuid = :uuid AND is_active = 1"),
+        text("SELECT image_order FROM user WHERE uuid = :uuid"),
         {"uuid": peer_uuid},
     ).mappings().fetchone()
     if not row:
@@ -603,7 +565,7 @@ def set_image_order(db: Session, peer_hex: str, order: list) -> None:
     peer_uuid = _peer_uuid_bytes(peer_hex)
     value = ",".join(str(int(n)) for n in order)
     db.execute(
-        text("UPDATE user SET image_order = :order WHERE uuid = :uuid AND is_active = 1"),
+        text("UPDATE user SET image_order = :order WHERE uuid = :uuid"),
         {"order": value, "uuid": peer_uuid},
     )
     db.commit()
@@ -619,7 +581,7 @@ def get_peer(db: Session, peer_hex: str):
             raise Exception("Invalid peer uuid")
 
         select_query = text("""
-        SELECT name, about_me FROM user WHERE uuid = :uuid AND is_active = 1
+        SELECT name, about_me FROM user WHERE uuid = :uuid
         """)
         row = db.execute(select_query, {"uuid": peer_uuid}).mappings().fetchone()
         if not row:
@@ -671,7 +633,7 @@ def register_peer_token(db: Session, peer_hex: str, token: str):
             raise Exception("Invalid peer uuid")
 
         update_query = text("""
-        UPDATE user SET fcm_token = :token WHERE uuid = :uuid AND is_active = 1
+        UPDATE user SET fcm_token = :token WHERE uuid = :uuid
         """)
         result = db.execute(update_query, {"token": token, "uuid": peer_uuid})
         db.commit()
@@ -697,7 +659,7 @@ def register_peer_voip_token(db: Session, peer_hex: str, token: str):
             raise Exception("Invalid peer uuid")
 
         update_query = text("""
-        UPDATE user SET voip_token = :token WHERE uuid = :uuid AND is_active = 1
+        UPDATE user SET voip_token = :token WHERE uuid = :uuid
         """)
         result = db.execute(update_query, {"token": token, "uuid": peer_uuid})
         db.commit()
@@ -720,7 +682,7 @@ def get_peer_push_info(db: Session, peer_hex: str):
     if len(peer_uuid) != 16:
         return (None, "", None)
     row = db.execute(
-        text("SELECT fcm_token, name, voip_token FROM user WHERE uuid = :uuid AND is_active = 1"),
+        text("SELECT fcm_token, name, voip_token FROM user WHERE uuid = :uuid"),
         {"uuid": peer_uuid},
     ).mappings().fetchone()
     if not row:
@@ -738,7 +700,7 @@ def get_peer_name(db: Session, peer_hex: str):
     if len(peer_uuid) != 16:
         return None
     row = db.execute(
-        text("SELECT name FROM user WHERE uuid = :uuid AND is_active = 1"),
+        text("SELECT name FROM user WHERE uuid = :uuid"),
         {"uuid": peer_uuid},
     ).mappings().fetchone()
     return (row["name"] if row and row["name"] else None)
@@ -1229,13 +1191,15 @@ def active_status(db: Session, peer_hexes):
     return status
 
 def activate_user(db: Session, user_hex: str, is_active: bool):
-    """Sets a peer's is_active flag. X-API-Key only. Deliberately does NOT filter on is_active in
-    the WHERE clause so an already-inactive user can re-activate themselves.
+    """Sets a peer's is_active flag (Peers-mode active = discoverable). X-API-Key only. Deliberately
+    does NOT filter on is_active in the WHERE clause so an already-inactive user can re-activate.
 
-    NOTE: is_active is also used across the codebase as a 'valid record' filter (get_peer /
-    update_peer etc. select `... AND is_active = 1`), so setting a user inactive also hides them
-    from peer lookups — intended for 'not discoverable', but it likewise blocks their own profile
-    reads/updates until active again. Switch to a dedicated column if presence must be independent."""
+    NOTE: for PEERS, is_active now means ONLY 'discoverable nearby' — since inactive (Friends mode /
+    low-power sleep) is the default, the peer-by-uuid queries (get_peer / update_peer / image_order /
+    register_peer_token / register_peer_voip_token / get_peer_push_info / get_peer_name) must NOT filter
+    on it, or sleeping peers couldn't be profiled, messaged, or PUSHED a call/chat. Only peers_online
+    (active_status / filter_active_peers) reads is_active, as the discovery gate. The email-keyed admin
+    login queries keep `AND u.is_active = 1` (a deactivated admin account should stay locked out)."""
     try:
         try:
             user_uuid = bytes.fromhex(user_hex)
