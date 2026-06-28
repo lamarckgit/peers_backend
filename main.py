@@ -313,6 +313,25 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 msg_type = data.get("type")
                 print(f"relay {client_id} → {target_id}: {msg_type}")
 
+                # Block gate: a blocked combination (user_user.is_active = 0, either direction) can neither
+                # chat nor call. Drop it and bounce a generic "communication failure" back to the SENDER
+                # (generic on purpose — it does not reveal that they've been blocked).
+                if msg_type in ("CHAT_MESSAGE", "CHAT_REQUEST", "CALL_REQUEST"):
+                    try:
+                        s_b = database.create_session()
+                        try:
+                            if response_module.is_blocked(s_b, client_id, target_id):
+                                print(f"relay: {msg_type} {client_id[:8]} → {target_id[:8]} BLOCKED — dropped")
+                                try:
+                                    await websocket.send_json({"type": "COMM_FAILURE", "target": target_id})
+                                except Exception:
+                                    pass
+                                continue
+                        finally:
+                            s_b.close()
+                    except Exception as e:
+                        print(f"relay block-check error: {e}")
+
                 # Cache live-location position (delivered or not) so a reconnecting receiver gets the
                 # latest pin; clear it when the share stops.
                 if msg_type == "LOCATION_UPDATE":
@@ -387,10 +406,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         try:
                             s = database.create_session()
                             try:
-                                # Privacy: only a Friend may wake a killed/offline peer for a chat or
-                                # call. The friend handshake itself (FRIEND_*) is always allowed so
-                                # friend requests/answers can still reach an offline peer.
-                                if msg_type in ("CHAT_REQUEST", "CALL_REQUEST") and not response_module.are_friends(s, client_id, target_id):
+                                # Privacy: only a Friend may wake a killed/offline peer for a CALL. A CHAT
+                                # request from a non-friend IS pushed so a BACKGROUNDED receiver gets the
+                                # incoming-chat dialog: the FCM banner is the only way iOS lets the app come
+                                # forward (a chat can't auto-present like a CallKit call). A KILLED app can't
+                                # accept, so the sender just times out; the only window a just-killed peer
+                                # still sees a banner is the brief presence latency before it leaves the
+                                # nearby list. FRIEND_* is always allowed.
+                                if msg_type == "CALL_REQUEST" and not response_module.are_friends(s, client_id, target_id):
                                     print(f"relay: {msg_type} to offline {target_id[:8]} suppressed (sender not a friend)")
                                 else:
                                     fcm_token, _, voip_token = response_module.get_peer_push_info(s, target_id)
@@ -405,7 +428,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         sent = response_module.send_voip_push(voip_token, msg_type, client_id, sender_name, extra)
                                         print(f"relay: VoIP push to {target_id[:8]} {msg_type} sent={sent}")
                                     if not sent and fcm_token:
-                                        sent = response_module.send_signal_push(fcm_token, msg_type, client_id, sender_name, extra)
+                                        # A friend request / acceptance creates an unread chat card / message,
+                                        # so badge the app icon (killed app), like a chat message.
+                                        push_badge = manager.next_badge(target_id) if msg_type in ("FRIEND_REQUEST", "FRIEND_ACCEPT") else None
+                                        sent = response_module.send_signal_push(fcm_token, msg_type, client_id, sender_name, extra, badge=push_badge)
                                         print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={sent}")
                                     if not sent and not voip_token and not fcm_token:
                                         print(f"relay: offline target {target_id[:8]} has no push token")
@@ -1042,12 +1068,13 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     # while dropping a genuinely-inactive one even in BLE range).
     status = response_module.active_status(db, params.uuids)
     inactive = [h for h, active in status.items() if not active]
-    online = [u for u in connected if status.get(u, False)]
-    if online:
-        # Drop peers this caller has blocked (or who blocked them) so they vanish from the nearby list.
-        blocked = response_module.blocked_peer_set(db, params.uuid, online)
-        online = [u for u in online if u not in blocked]
-    return {"online": online, "inactive": inactive}
+    # Blocked combinations (user_user.is_active=0, either direction) over ALL queried peers — reported
+    # EXPLICITLY (like `inactive`) so the app hides them even while in BLE range, and un-hides the instant
+    # the block is removed (row gone or is_active=1, e.g. they became friends). A blocked peer is also kept
+    # out of `online`.
+    blocked = list(response_module.blocked_peer_set(db, params.uuid, params.uuids))
+    online = [u for u in connected if status.get(u, False) and u not in blocked]
+    return {"online": online, "inactive": inactive, "blocked": blocked}
 
 # Permanently blocks a peer for this user: marks (or creates) their user_user link is_active = 0, so
 # the combination disappears from nearby + friends and can no longer wake either side. X-API-Key only.
@@ -1151,6 +1178,25 @@ async def get_peer_post(params: RequestPeerLookup, db: Session = Depends(get_db)
 
         return response
 
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Resolve a 6-char public peer code (peer_name) to a peer's uuid + name — so a peer who types a friend's
+# code can address a friend request to them. Authenticated (the caller is a registered peer).
+class RequestPeerByCode(BaseModel):
+    code: str
+    caller_uuid: str
+
+@app.post("/v1/peer_by_code/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def peer_by_code(params: RequestPeerByCode, db: Session = Depends(get_db)):
+    try:
+        match = response_module.find_peer_by_code(db, params.code)
+        if not match:
+            return JSONResponse(content={"success": False, "error": "No peer with that code"},
+                                status_code=status.HTTP_404_NOT_FOUND)
+        return {"success": True, "uuid": match["uuid"], "name": match["name"]}
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:

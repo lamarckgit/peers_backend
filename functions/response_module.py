@@ -47,6 +47,7 @@ except ValueError:
 class ResponseCreatePeer(BaseModel):
     success: bool
     uuid: str
+    peer_name: str = ""        # 6-char public peer code (others use it to send a friend request)
     error: str
 
 class ResponsePeer(BaseModel):
@@ -54,6 +55,7 @@ class ResponsePeer(BaseModel):
     uuid: str
     name: str
     about_me: str
+    peer_name: str = ""        # 6-char public peer code shown under the profile picture
     image_data: str = None
     error: str
 
@@ -472,17 +474,30 @@ def set_share_uses(db: Session, link_id):
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
+# Public peer code alphabet: 6 chars of [0-9 a-z A-Z] (62^6 ≈ 56 billion combos). Shown under a peer's
+# profile picture; another peer types it to send a friend request. Generated with `secrets` for unbiased
+# randomness, retried on the (vanishingly rare) collision.
+_PEER_CODE_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def generate_peer_code(db: Session) -> str:
+    for _ in range(25):
+        code = "".join(secrets.choice(_PEER_CODE_ALPHABET) for _ in range(6))
+        if not db.execute(text("SELECT 1 FROM user WHERE peer_name = :c"), {"c": code}).fetchone():
+            return code
+    raise Exception("Could not allocate a unique peer code")
+
 def create_peer(db: Session, peer_uuid: bytes, name: str, about_me: str = ""):
     try:
+        peer_code = generate_peer_code(db)
         insert_query = text("""
-        INSERT INTO user (uuid, name, about_me) VALUES (:uuid, :name, :about_me)
+        INSERT INTO user (uuid, name, about_me, peer_name) VALUES (:uuid, :name, :about_me, :peer_name)
         """)
         # peer_uuid is the raw 16-byte value stored in the BINARY(16) `uuid` column.
-        db.execute(insert_query, {"uuid": peer_uuid, "name": name, "about_me": about_me})
+        db.execute(insert_query, {"uuid": peer_uuid, "name": name, "about_me": about_me, "peer_name": peer_code})
         db.commit()
 
         # Convert the 16-byte value to a reversible ASCII (hex) string for the response.
-        return ResponseCreatePeer(success=True, uuid=peer_uuid.hex(), error="")
+        return ResponseCreatePeer(success=True, uuid=peer_uuid.hex(), peer_name=peer_code, error="")
 
     except SQLAlchemyError as e:
         raise RuntimeError(f"Database error: {str(e)}")
@@ -581,17 +596,27 @@ def get_peer(db: Session, peer_hex: str):
             raise Exception("Invalid peer uuid")
 
         select_query = text("""
-        SELECT name, about_me FROM user WHERE uuid = :uuid
+        SELECT name, about_me, peer_name FROM user WHERE uuid = :uuid
         """)
         row = db.execute(select_query, {"uuid": peer_uuid}).mappings().fetchone()
         if not row:
             raise Exception("Peer not found")
+
+        # Lazy backfill: peers created before the peer_name column existed have none yet — mint one on
+        # first lookup so every peer ends up with a code.
+        peer_code = row["peer_name"]
+        if not peer_code:
+            peer_code = generate_peer_code(db)
+            db.execute(text("UPDATE user SET peer_name = :c WHERE uuid = :uuid"),
+                       {"c": peer_code, "uuid": peer_uuid})
+            db.commit()
 
         return ResponsePeer(
             success=True,
             uuid=peer_hex,
             name=row["name"] or "",
             about_me=row["about_me"] or "",
+            peer_name=peer_code,
             error="",
         )
 
@@ -599,6 +624,22 @@ def get_peer(db: Session, peer_hex: str):
         raise RuntimeError(f"Database error: {str(e)}")
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
+
+def find_peer_by_code(db: Session, code: str):
+    """Resolve a 6-char public peer code (peer_name) to {uuid (hex), name}, used when a peer types a code
+    to send a friend request. Returns None when no peer has that code."""
+    code = (code or "").strip()
+    if not code:
+        return None
+    row = db.execute(
+        text("SELECT uuid, name FROM user WHERE peer_name = :c"),
+        {"c": code},
+    ).mappings().fetchone()
+    if not row:
+        return None
+    raw = row["uuid"]
+    uuid_hex = raw.hex() if isinstance(raw, (bytes, bytearray)) else str(raw)
+    return {"uuid": uuid_hex, "name": row["name"] or ""}
 
 def peer_exists(db: Session, peer_hex: str) -> bool:
     """True if a row with this uuid exists in the user table — regardless of is_active, so an
@@ -705,7 +746,7 @@ def get_peer_name(db: Session, peer_hex: str):
     ).mappings().fetchone()
     return (row["name"] if row and row["name"] else None)
 
-def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extra: dict = None):
+def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extra: dict = None, badge: int = None):
     """Builds the (data, AndroidConfig, APNSConfig) shared by the single- and multi-recipient signal
     pushes, so both fan-outs stay byte-for-byte identical. Mirrors the SafeXS doorbell push
     (notify_safexs_doorbell), proven to reach force-quit apps:
@@ -737,6 +778,7 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
         alert=messaging.ApsAlert(title=title, body=body),
         sound="default",
         content_available=True,
+        badge=badge,          # app-icon count for a killed/backgrounded app (None ⇒ unchanged)
         # Time Sensitive so a killed/backgrounded app's call/chat banner is prominent, retained on the
         # lock screen, and breaks through Focus/Do Not Disturb — matching the in-app local notification.
         custom_data={"interruption-level": "time-sensitive"},
@@ -791,7 +833,7 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
         return False
 
 
-def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None) -> bool:
+def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None, badge: int = None) -> bool:
     """Pushes a signaling event (chat / friend / call) to ONE backgrounded/killed peer via the
     PEERS.CLUB Firebase app. Payload is built by _build_signal_payload (mirrors the SafeXS doorbell
     push). For fanning the same signal out to several devices (group calls) use send_signal_push_multi.
@@ -804,7 +846,7 @@ def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_n
         return False
     if not target_token:
         return False
-    data, android_config, apns_config = _build_signal_payload(msg_type, sender_hex, sender_name, extra)
+    data, android_config, apns_config = _build_signal_payload(msg_type, sender_hex, sender_name, extra, badge)
     try:
         message = messaging.Message(
             token=target_token,
@@ -1055,6 +1097,24 @@ def block_peer(db: Session, user_hex: str, blocked_hex: str):
         raise RuntimeError(f"Database error: {str(e)}")
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
+
+def is_blocked(db: Session, hex_a: str, hex_b: str) -> bool:
+    """True if peers a and b are blocked — a user_user link with is_active = 0 in EITHER direction. Used
+    by the relay to refuse to deliver chat messages / call signals between a blocked combination."""
+    try:
+        a = bytes.fromhex(hex_a)
+        b = bytes.fromhex(hex_b)
+    except (ValueError, TypeError):
+        return False
+    if len(a) != 16 or len(b) != 16:
+        return False
+    row = db.execute(
+        text("""SELECT 1 FROM user_user
+                WHERE ((uuid_1 = :a AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :a))
+                  AND is_active = 0 LIMIT 1"""),
+        {"a": a, "b": b},
+    ).fetchone()
+    return row is not None
 
 def blocked_peer_set(db: Session, user_hex: str, peer_hexes):
     """Returns the subset of peer_hexes that are BLOCKED with user_hex (a user_user link with
