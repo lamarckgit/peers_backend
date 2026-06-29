@@ -495,6 +495,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 s.close()
                         except Exception as e:
                             print(f"relay FCM fallback error: {e}")
+                    elif msg_type == "GROUP_CALL_REQUEST":
+                        # Wake a backgrounded/killed group member for an incoming GROUP call via an FCM alert
+                        # (no CallKit/VoIP for groups yet). Carries group id/name + video so the app rings the
+                        # right incoming dialog. The initiator only rings members, so membership is implied.
+                        try:
+                            s = database.create_session()
+                            try:
+                                fcm_token, _, _ = response_module.get_peer_push_info(s, target_id)
+                                _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
+                                if fcm_token:
+                                    sent = response_module.send_group_call_push(
+                                        fcm_token, client_id, sender_name,
+                                        str(data.get("groupId") or ""), data.get("groupName") or "",
+                                        bool(data.get("video")))
+                                    print(f"relay: group-call push to {target_id[:8]} sent={sent}")
+                                else:
+                                    print(f"relay: offline member {target_id[:8]} has no push token")
+                            finally:
+                                s.close()
+                        except Exception as e:
+                            print(f"relay group-call push error: {e}")
                     elif msg_type in ("CHAT_EDIT", "CHAT_DELETE"):
                         # Hold the edit/delete and deliver it when the (killed/offline) target returns,
                         # so the Sender's edit/delete still applies at the Receiver's end. `data` already

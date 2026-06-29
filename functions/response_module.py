@@ -874,6 +874,43 @@ def send_group_message_push(target_token: str, sender_hex: str, sender_name: str
         return False
 
 
+def send_group_call_push(target_token: str, sender_hex: str, sender_name: str, group_id: str,
+                         group_name: str, video: bool) -> bool:
+    """Visible 'incoming group call' push to ONE offline/backgrounded member (FCM alert; no CallKit for
+    groups yet). Title = the group name, body = '<name> is starting a group audio/video call'. action =
+    GROUP_CALL_REQUEST + group_id/group_name/video so the app rings the incoming group-call dialog on tap.
+    False (no raise) on not-configured / empty token / error."""
+    if app_peers is None:
+        print("send_group_call_push: PEERS.CLUB Firebase app not configured — push skipped.")
+        return False
+    if not target_token:
+        return False
+    name = sender_name or "A peer"
+    title = group_name or "Group call"
+    body = f"{name} is starting a group {'video' if video else 'audio'} call"
+    data = {"action": "GROUP_CALL_REQUEST", "sender_id": sender_hex, "sender_name": name,
+            "group_id": str(group_id), "group_name": group_name or "", "video": "1" if video else "0"}
+    aps_object = messaging.Aps(
+        alert=messaging.ApsAlert(title=title, body=body),
+        sound="default",
+        content_available=True,
+        custom_data={"interruption-level": "time-sensitive"},
+    )
+    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    apns_config = messaging.APNSConfig(
+        headers={"apns-priority": "10", "apns-push-type": "alert"},
+        payload=messaging.APNSPayload(aps=aps_object),
+    )
+    try:
+        message = messaging.Message(token=target_token, data=data, android=android_config, apns=apns_config)
+        response = messaging.send(message, app=app_peers)
+        print(f"send_group_call_push: group {group_id} from {sender_hex[:8]} → {response}")
+        return True
+    except Exception as e:
+        print(f"send_group_call_push error [{type(e).__name__}]: {e}")
+        return False
+
+
 def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None, badge: int = None) -> bool:
     """Pushes a signaling event (chat / friend / call) to ONE backgrounded/killed peer via the
     PEERS.CLUB Firebase app. Payload is built by _build_signal_payload (mirrors the SafeXS doorbell
