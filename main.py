@@ -295,6 +295,51 @@ manager = ConnectionManager()
 # Add the logging middleware to the app
 # app.add_middleware(LogMiddleware)
 
+async def relay_group_message(client_id: str, data: dict, msg_type: str):
+    """Fans a GROUP_MESSAGE / GROUP_EDIT / GROUP_DELETE out to every other member of the group: a live
+    socket send when the member is online, otherwise queued for their reconnect (so a killed member still
+    gets it) plus — for a new GROUP_MESSAGE — a visible FCM push. Membership (not friendship) authorises
+    delivery, so members who aren't friends with each other still receive group messages."""
+    group_id = data.get("groupId")
+    if not group_id:
+        return
+    try:
+        s = database.create_session()
+        try:
+            members = response_module.group_member_hexes(s, group_id)
+            sender_name = data.get("senderName") or ""
+            if not sender_name:
+                _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
+            for member_id in members:
+                if member_id == client_id:
+                    continue
+                delivered = False
+                ws = manager.active_connections.get(member_id)
+                if ws is not None:
+                    try:
+                        await ws.send_json(data)
+                        delivered = True
+                    except Exception as e:
+                        print(f"relay group: send to {member_id[:8]} failed ({e}); dropping stale socket")
+                        manager.disconnect(member_id)
+                if not delivered:
+                    # Queue for reconnect (so the killed member still gets it) and, for a new message,
+                    # raise a visible push.
+                    manager.enqueue(member_id, data)
+                    if msg_type == "GROUP_MESSAGE":
+                        fcm_token, _, _ = response_module.get_peer_push_info(s, member_id)
+                        if fcm_token:
+                            badge = manager.next_badge(member_id)
+                            response_module.send_group_message_push(
+                                fcm_token, client_id, sender_name, str(group_id),
+                                data.get("groupName") or "", data.get("text") or "",
+                                badge, data.get("msgId") or "")
+        finally:
+            s.close()
+    except Exception as e:
+        print(f"relay group error: {e}")
+
+
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await manager.connect(client_id, websocket)
@@ -302,6 +347,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         while True:
             # Receive JSON data (Offer, Answer, or Candidate)
             data = await websocket.receive_json()
+
+            # Group chat messages have no single target — the relay fans them out to all members.
+            if data.get("type") in ("GROUP_MESSAGE", "GROUP_EDIT", "GROUP_DELETE"):
+                data["sender"] = client_id
+                await relay_group_message(client_id, data, data.get("type"))
+                continue
 
             # The client must specify who the message is for
             target_id = data.get("target")
@@ -402,7 +453,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             print(f"relay chat-msg push error: {e}")
                     # Signal types that warrant a push when the target is offline
                     # (backgrounded/killed): chat request, call request + the friend handshake.
-                    elif msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND"):
+                    elif msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND", "GROUP_INVITE"):
                         try:
                             s = database.create_session()
                             try:
@@ -420,6 +471,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
                                     # Carry the call's audio/video flag through to the push.
                                     extra = {"video": "1" if data.get("video") else "0"} if msg_type == "CALL_REQUEST" else None
+                                    # A group invite carries the group id + name so the receiver's app can
+                                    # build the Join/Reject card from the push.
+                                    if msg_type == "GROUP_INVITE":
+                                        extra = {"group_id": str(data.get("groupId") or ""),
+                                                 "group_name": data.get("groupName") or ""}
                                     sent = False
                                     # A CALL to a CallKit-capable peer → native VoIP push (rings via
                                     # CallKit from a killed/locked state). Everything else (chat/friend,
@@ -430,7 +486,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     if not sent and fcm_token:
                                         # A friend request / acceptance creates an unread chat card / message,
                                         # so badge the app icon (killed app), like a chat message.
-                                        push_badge = manager.next_badge(target_id) if msg_type in ("FRIEND_REQUEST", "FRIEND_ACCEPT") else None
+                                        push_badge = manager.next_badge(target_id) if msg_type in ("FRIEND_REQUEST", "FRIEND_ACCEPT", "GROUP_INVITE") else None
                                         sent = response_module.send_signal_push(fcm_token, msg_type, client_id, sender_name, extra, badge=push_badge)
                                         print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={sent}")
                                     if not sent and not voip_token and not fcm_token:
@@ -574,6 +630,39 @@ class RequestAddFriend(BaseModel):
 class RequestBlockPeer(BaseModel):
     uuid: str          # the blocker (authenticated by check_peer_uuid)
     blocked_uuid: str  # the peer being blocked
+
+# --- Groups ---
+class RequestCreateGroup(BaseModel):
+    uuid: str          # the creator / admin (authenticated)
+    group_name: str
+
+class RequestGroupMember(BaseModel):
+    uuid: str          # the joining user (authenticated)
+    group_id: int
+
+class RequestRemoveGroupMember(BaseModel):
+    uuid: str          # the caller (authenticated; must be the group admin)
+    group_id: int
+    member_uuid: str   # the member being removed
+
+class RequestGroupId(BaseModel):
+    uuid: str          # the caller (authenticated; must be the admin for delete/rename/image)
+    group_id: int
+
+class RequestUpdateGroupName(BaseModel):
+    uuid: str
+    group_id: int
+    group_name: str
+
+class RequestUpdateGroupAboutUs(BaseModel):
+    uuid: str
+    group_id: int
+    about_us: str = ""
+
+class RequestUpdateGroupImage(BaseModel):
+    uuid: str
+    group_id: int
+    image_data: str    # base64 JPEG
 
 class RequestActivateUser(BaseModel):
     uuid: str
@@ -1102,6 +1191,144 @@ async def add_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
 async def cancel_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
     try:
         return response_module.cancel_friend(db, params.uuid, params.friend_uuid)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# --- Groups -----------------------------------------------------------------------------------------
+# Creates a group (admin = the caller) and seeds its profile image with a copy of the brand logo at
+# static/profile_images/group_<id>.png. Returns the new group id + its (base64) image. The invites to
+# the selected friends are sent by the app over the relay (GROUP_INVITE), so the backend only persists.
+@app.post("/v1/create_group/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def create_group(params: RequestCreateGroup, db: Session = Depends(get_db)):
+    try:
+        group_id = response_module.create_group(db, params.uuid, params.group_name)
+        # No default image is seeded — the app renders its own standard group placeholder until the admin
+        # uploads one (update_group_image then writes group_<id>.png, which get_groups serves).
+        return {"success": True, "group_id": group_id, "group_name": params.group_name, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Adds the caller to a group (when they tap Join on the invite card). Idempotent. Returns exists=False
+# (HTTP 200) when the group was deleted in the meantime, so the app can drop the stale invite card.
+@app.post("/v1/join_group/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def join_group(params: RequestGroupMember, db: Session = Depends(get_db)):
+    try:
+        if not response_module.group_exists(db, params.group_id):
+            return {"success": False, "exists": False, "error": "Group not found"}
+        response_module.add_group_member(db, params.uuid, params.group_id)
+        return {"success": True, "exists": True, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Removes a member from a group — admin only.
+@app.post("/v1/remove_group_member/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def remove_group_member(params: RequestRemoveGroupMember, db: Session = Depends(get_db)):
+    try:
+        admin = response_module.group_admin_hex(db, params.group_id)
+        if not admin or admin.lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the group admin"}, status_code=403)
+        return response_module.remove_group_member(db, params.member_uuid, params.group_id)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Returns the caller's groups (each with its profile image), as {"groups": [...]}.
+@app.post("/v1/groups/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def get_groups(params: RequestId, db: Session = Depends(get_db)):
+    try:
+        groups = response_module.get_groups(db, params.uuid)
+        for g in groups:
+            file_path = os.path.join(PROFILE_DIR, f"group_{g['id']}.png")
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as fh:
+                    g["image_data"] = base64.b64encode(fh.read()).decode("ascii")
+        return {"groups": groups}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Renames a group — admin only.
+@app.post("/v1/update_group_name/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def update_group_name(params: RequestUpdateGroupName, db: Session = Depends(get_db)):
+    try:
+        admin = response_module.group_admin_hex(db, params.group_id)
+        if not admin or admin.lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the group admin"}, status_code=403)
+        return response_module.update_group_name(db, params.group_id, params.group_name)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Sets a group's "about us" text — admin only.
+@app.post("/v1/update_group_about_us/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def update_group_about_us(params: RequestUpdateGroupAboutUs, db: Session = Depends(get_db)):
+    try:
+        admin = response_module.group_admin_hex(db, params.group_id)
+        if not admin or admin.lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the group admin"}, status_code=403)
+        return response_module.update_group_about_us(db, params.group_id, params.about_us)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Returns a group's members (each with their profile image), as {"members": [...]}. Any authenticated peer
+# may query (group ids aren't enumerable); used to show the Members grid on the group profile page.
+@app.post("/v1/group_members/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def group_members(params: RequestGroupMember, db: Session = Depends(get_db)):
+    try:
+        members = response_module.group_members(db, params.group_id)
+        for m in members:
+            file_path = os.path.join(PROFILE_DIR, f"peer_{m['uuid']}.jpg")
+            if os.path.exists(file_path):
+                with open(file_path, "rb") as fh:
+                    m["image_data"] = base64.b64encode(fh.read()).decode("ascii")
+        return {"members": members}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Replaces a group's profile image (group_<id>.png) — admin only.
+@app.post("/v1/update_group_image/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def update_group_image(params: RequestUpdateGroupImage, db: Session = Depends(get_db)):
+    try:
+        admin = response_module.group_admin_hex(db, params.group_id)
+        if not admin or admin.lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the group admin"}, status_code=403)
+        dst = os.path.join(PROFILE_DIR, f"group_{params.group_id}.png")
+        with open(dst, "wb") as f:
+            f.write(base64.b64decode(params.image_data))
+        return {"success": True, "image_data": params.image_data, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Deletes a group + all its memberships and image — admin only.
+@app.post("/v1/delete_group/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def delete_group(params: RequestGroupId, db: Session = Depends(get_db)):
+    try:
+        admin = response_module.group_admin_hex(db, params.group_id)
+        if not admin or admin.lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the group admin"}, status_code=403)
+        result = response_module.delete_group(db, params.group_id)
+        try:
+            p = os.path.join(PROFILE_DIR, f"group_{params.group_id}.png")
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as img_err:
+            print(f"delete_group image remove failed: {img_err}")
+        return result
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:

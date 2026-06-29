@@ -767,8 +767,12 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
         "FRIEND_ACCEPT":  ("New friend",        f"You're friends now with {name}"),
         "NOFRIEND":       ("Friend request",    f"{name} declined your friend request"),
         "UNFRIEND":       ("Friendship ended",  f"{name} ended the friendship"),
+        "GROUP_INVITE":   ("Group invite",      f"{name} added you to a group"),
     }
     title, body = copy.get(msg_type, ("PEERS.CLUB", "New activity"))
+    # A group invite names the group when it's carried in `extra` ("<name> added you to <group>").
+    if msg_type == "GROUP_INVITE" and extra and extra.get("group_name"):
+        body = f"{name} added you to {extra['group_name']}"
     # iOS routing actions: chat → INCOMING_CHAT, call → INCOMING_CALL, friend → the WS type verbatim.
     fcm_action = {"CHAT_REQUEST": "INCOMING_CHAT", "CALL_REQUEST": "INCOMING_CALL"}.get(msg_type, msg_type)
     data = {"action": fcm_action, "sender_id": sender_hex, "sender_name": name}
@@ -830,6 +834,43 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
         return True
     except Exception as e:
         print(f"send_chat_message_push error [{type(e).__name__}]: {e}")
+        return False
+
+
+def send_group_message_push(target_token: str, sender_hex: str, sender_name: str, group_id: str,
+                            group_name: str, text: str, badge: int, msg_id: str = "") -> bool:
+    """Visible 'new group message' push to ONE offline/backgrounded group member. Title = the group name,
+    body = '<sender>: <text>'. action=GROUP_MESSAGE + group_id/group_name so a tap opens the group chat,
+    text + msg_id so the app stores the message (de-dup). False (no raise) on not-configured/empty/error."""
+    if app_peers is None:
+        print("send_group_message_push: PEERS.CLUB Firebase app not configured — push skipped.")
+        return False
+    if not target_token:
+        return False
+    name = sender_name or "A peer"
+    title = group_name or "Group"
+    body = f"{name}: {text}" if text else f"{name} sent a message"
+    data = {"action": "GROUP_MESSAGE", "sender_id": sender_hex, "sender_name": name,
+            "group_id": str(group_id), "group_name": group_name or "", "text": text or "", "msg_id": msg_id or ""}
+    aps_object = messaging.Aps(
+        alert=messaging.ApsAlert(title=title, body=body),
+        sound="default",
+        badge=badge,
+        content_available=True,
+        custom_data={"interruption-level": "time-sensitive"},
+    )
+    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    apns_config = messaging.APNSConfig(
+        headers={"apns-priority": "10", "apns-push-type": "alert"},
+        payload=messaging.APNSPayload(aps=aps_object),
+    )
+    try:
+        message = messaging.Message(token=target_token, data=data, android=android_config, apns=apns_config)
+        response = messaging.send(message, app=app_peers)
+        print(f"send_group_message_push: group {group_id} from {sender_hex[:8]} badge={badge} → {response}")
+        return True
+    except Exception as e:
+        print(f"send_group_message_push error [{type(e).__name__}]: {e}")
         return False
 
 
@@ -1200,6 +1241,132 @@ def get_friends(db: Session, user_hex: str):
         {"uuid": r["fuid"].hex(), "name": r["name"] or "", "about_me": r["about_me"] or ""}
         for r in rows
     ]
+
+# --- Groups ------------------------------------------------------------------------------------------
+# A `group` row is (id AUTO_INCREMENT, group_name, admin_user_uuid BINARY(16)). Membership lives in
+# `user_group` (uuid BINARY(16), group_id INT) — the admin is inserted as a member at creation, so the
+# group surfaces in his list immediately and joiners are appended as they accept the invite. `group` is a
+# reserved word in MySQL, so it is back-ticked everywhere.
+
+def create_group(db: Session, admin_hex: str, group_name: str) -> int:
+    """Creates a group owned by admin_hex and adds the admin as the first member. Returns the new
+    group id (the AUTO_INCREMENT primary key — used for the image filename group_<id>.png)."""
+    admin_uuid = _peer_uuid_bytes(admin_hex)
+    name = (group_name or "").strip() or "Group"
+    result = db.execute(
+        text("INSERT INTO `group` (name, admin_user_uuid) VALUES (:n, :a)"),
+        {"n": name, "a": admin_uuid},
+    )
+    group_id = int(result.lastrowid)
+    db.execute(
+        text("INSERT INTO user_group (user_uuid, group_id) VALUES (:u, :g)"),
+        {"u": admin_uuid, "g": group_id},
+    )
+    db.commit()
+    return group_id
+
+def group_exists(db: Session, group_id: int) -> bool:
+    """True if a group row with this id still exists (used to reject joining a deleted group)."""
+    row = db.execute(text("SELECT 1 FROM `group` WHERE id = :g"), {"g": group_id}).fetchone()
+    return row is not None
+
+def remove_group_member(db: Session, member_hex: str, group_id: int):
+    """Removes member_hex from a group (admin-only — the endpoint authorises). Idempotent."""
+    member_uuid = _peer_uuid_bytes(member_hex)
+    db.execute(
+        text("DELETE FROM user_group WHERE user_uuid = :u AND group_id = :g"),
+        {"u": member_uuid, "g": group_id},
+    )
+    db.commit()
+    return ResponseResult(success=True, error="")
+
+def add_group_member(db: Session, user_hex: str, group_id: int):
+    """Adds user_hex to a group (idempotent). Called when a friend taps Join on the invite card."""
+    user_uuid = _peer_uuid_bytes(user_hex)
+    existing = db.execute(
+        text("SELECT 1 FROM user_group WHERE user_uuid = :u AND group_id = :g"),
+        {"u": user_uuid, "g": group_id},
+    ).fetchone()
+    if not existing:
+        db.execute(
+            text("INSERT INTO user_group (user_uuid, group_id) VALUES (:u, :g)"),
+            {"u": user_uuid, "g": group_id},
+        )
+        db.commit()
+    return ResponseResult(success=True, error="")
+
+def get_groups(db: Session, user_hex: str):
+    """Returns the groups the user belongs to as dicts {id, group_name, admin_uuid (hex)}. Images are
+    attached by the endpoint (group_<id>.png in PROFILE_DIR)."""
+    user_uuid = _peer_uuid_bytes(user_hex)
+    rows = db.execute(
+        text("""
+        SELECT g.id AS id, g.name AS group_name, g.about_us AS about_us, g.admin_user_uuid AS admin
+        FROM user_group ug JOIN `group` g ON g.id = ug.group_id
+        WHERE ug.user_uuid = :me
+        """),
+        {"me": user_uuid},
+    ).mappings().fetchall()
+    return [
+        {"id": int(r["id"]), "group_name": r["group_name"] or "", "about_us": r["about_us"] or "",
+         "admin_uuid": r["admin"].hex() if r["admin"] else ""}
+        for r in rows
+    ]
+
+def group_members(db: Session, group_id: int):
+    """Returns a group's members as dicts {uuid (hex), name}. Profile images are attached by the
+    endpoint (peer_<uuid>.jpg), like get_friends."""
+    rows = db.execute(
+        text("""
+        SELECT u.uuid AS uuid, u.name AS name
+        FROM user_group ug JOIN user u ON u.uuid = ug.user_uuid
+        WHERE ug.group_id = :g
+        """),
+        {"g": group_id},
+    ).mappings().fetchall()
+    return [{"uuid": r["uuid"].hex(), "name": r["name"] or ""} for r in rows]
+
+def group_admin_hex(db: Session, group_id: int):
+    """The hex uuid of a group's admin, or None if the group doesn't exist."""
+    row = db.execute(
+        text("SELECT admin_user_uuid FROM `group` WHERE id = :g"),
+        {"g": group_id},
+    ).mappings().fetchone()
+    return row["admin_user_uuid"].hex() if row and row["admin_user_uuid"] else None
+
+def group_member_hexes(db: Session, group_id: int):
+    """Hex uuids of every member of a group (so the relay / endpoints can reach them)."""
+    rows = db.execute(
+        text("SELECT user_uuid FROM user_group WHERE group_id = :g"),
+        {"g": group_id},
+    ).fetchall()
+    return [r[0].hex() for r in rows]
+
+def update_group_name(db: Session, group_id: int, name: str):
+    """Renames a group (admin-only — the endpoint authorises). Idempotent."""
+    db.execute(
+        text("UPDATE `group` SET name = :n WHERE id = :g"),
+        {"n": (name or "").strip() or "Group", "g": group_id},
+    )
+    db.commit()
+    return ResponseResult(success=True, error="")
+
+def update_group_about_us(db: Session, group_id: int, about_us: str):
+    """Sets a group's about_us text (admin-only — the endpoint authorises). Idempotent."""
+    db.execute(
+        text("UPDATE `group` SET about_us = :a WHERE id = :g"),
+        {"a": about_us or "", "g": group_id},
+    )
+    db.commit()
+    return ResponseResult(success=True, error="")
+
+def delete_group(db: Session, group_id: int):
+    """Deletes a group and all its memberships (admin-only — the endpoint authorises). The image file
+    is removed by the endpoint (which owns PROFILE_DIR). Idempotent."""
+    db.execute(text("DELETE FROM user_group WHERE group_id = :g"), {"g": group_id})
+    db.execute(text("DELETE FROM `group` WHERE id = :g"), {"g": group_id})
+    db.commit()
+    return ResponseResult(success=True, error="")
 
 def filter_active_peers(db: Session, peer_hexes):
     """Given a list of hex uuids, returns those whose user row has is_active = 1 (i.e. the peer
