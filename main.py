@@ -1331,6 +1331,29 @@ async def delete_group(params: RequestGroupId, db: Session = Depends(get_db)):
         admin = response_module.group_admin_hex(db, params.group_id)
         if not admin or admin.lower() != params.uuid.lower():
             return JSONResponse(content={"success": False, "error": "Not the group admin"}, status_code=403)
+        # Tell every member the group is gone — BEFORE removing the memberships (so the lookup still finds
+        # them). A member sitting in the group chat then removes it + closes the chat immediately; an
+        # offline member gets it queued for reconnect. Online → live socket, offline → queued.
+        try:
+            members = response_module.group_member_hexes(db, params.group_id)
+            _, admin_name, _ = response_module.get_peer_push_info(db, params.uuid)
+            notice = {"type": "GROUP_DELETED", "sender": params.uuid, "groupId": params.group_id,
+                      "groupName": response_module.group_name(db, params.group_id), "senderName": admin_name or ""}
+            for m in members:
+                if m == params.uuid:
+                    continue
+                ws = manager.active_connections.get(m)
+                delivered = False
+                if ws is not None:
+                    try:
+                        await ws.send_json(notice)
+                        delivered = True
+                    except Exception:
+                        manager.disconnect(m)
+                if not delivered:
+                    manager.enqueue(m, notice)
+        except Exception as notify_err:
+            print(f"delete_group notify error: {notify_err}")
         result = response_module.delete_group(db, params.group_id)
         try:
             p = os.path.join(PROFILE_DIR, f"group_{params.group_id}.png")

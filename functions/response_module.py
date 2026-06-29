@@ -1334,6 +1334,11 @@ def group_admin_hex(db: Session, group_id: int):
     ).mappings().fetchone()
     return row["admin_user_uuid"].hex() if row and row["admin_user_uuid"] else None
 
+def group_name(db: Session, group_id: int) -> str:
+    """The group's name (empty string if unknown)."""
+    row = db.execute(text("SELECT name FROM `group` WHERE id = :g"), {"g": group_id}).mappings().fetchone()
+    return (row["name"] if row and row["name"] else "")
+
 def group_member_hexes(db: Session, group_id: int):
     """Hex uuids of every member of a group (so the relay / endpoints can reach them)."""
     rows = db.execute(
