@@ -324,9 +324,9 @@ async def relay_group_message(client_id: str, data: dict, msg_type: str):
                         manager.disconnect(member_id)
                 if not delivered:
                     # Queue for reconnect (so the killed member still gets it) and, for a new message,
-                    # raise a visible push.
+                    # raise a visible push — but NOT for a system line (created/welcome/left).
                     manager.enqueue(member_id, data)
-                    if msg_type == "GROUP_MESSAGE":
+                    if msg_type == "GROUP_MESSAGE" and not data.get("groupSystem"):
                         fcm_token, _, _ = response_module.get_peer_push_info(s, member_id)
                         if fcm_token:
                             badge = manager.next_badge(member_id)
@@ -1221,6 +1221,16 @@ async def join_group(params: RequestGroupMember, db: Session = Depends(get_db)):
             return {"success": False, "exists": False, "error": "Group not found"}
         response_module.add_group_member(db, params.uuid, params.group_id)
         return {"success": True, "exists": True, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# The caller leaves a group (removes their own membership). Any member may call it (no admin check).
+@app.post("/v1/leave_group/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def leave_group(params: RequestGroupMember, db: Session = Depends(get_db)):
+    try:
+        return response_module.remove_group_member(db, params.uuid, params.group_id)
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:
