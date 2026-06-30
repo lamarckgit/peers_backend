@@ -516,10 +516,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 s.close()
                         except Exception as e:
                             print(f"relay group-call push error: {e}")
-                    elif msg_type in ("CHAT_EDIT", "CHAT_DELETE"):
-                        # Hold the edit/delete and deliver it when the (killed/offline) target returns,
-                        # so the Sender's edit/delete still applies at the Receiver's end. `data` already
-                        # has the sender stamped, so the flushed op is processed exactly like a live one.
+                    elif msg_type in ("CHAT_EDIT", "CHAT_DELETE", "CHAT_READ"):
+                        # Hold the edit/delete/read-receipt and deliver it when the (killed/offline) target
+                        # returns, so the Sender's edit/delete still applies — and a CHAT_READ (receiver
+                        # opened the chat) reaches the offline sender so their check turns green on reconnect.
+                        # `data` already has the sender stamped, so the flushed op is processed like a live one.
                         manager.enqueue(target_id, data)
                         print(f"relay: queued {msg_type} for offline {target_id[:8]}")
                     else:
