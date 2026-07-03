@@ -645,6 +645,10 @@ class RequestPeersOnline(BaseModel):
     uuid: str          # the calling peer's own uuid (authenticated by check_peer_uuid)
     uuids: List[str]   # the peer uuids whose online/active status is being queried
 
+class RequestUpdateOpenToFriends(BaseModel):
+    uuid: str              # the authenticated peer (check_peer_uuid)
+    is_open_for_new: bool  # True → open to making new friends (discoverable); False → hidden from new peers
+
 class RequestAddFriend(BaseModel):
     uuid: str
     friend_uuid: str
@@ -1185,7 +1189,11 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     # out of `online`.
     blocked = list(response_module.blocked_peer_set(db, params.uuid, params.uuids))
     online = [u for u in connected if status.get(u, False) and u not in blocked]
-    return {"online": online, "inactive": inactive, "blocked": blocked}
+    # Peers not open to making new friends (is_open_for_new=0) — reported separately (like `inactive`/
+    # `blocked`) so the app hides them from Nearby UNLESS they're already friends. Does NOT affect `online`
+    # (a closed peer who is a friend still shows online, e.g. for the friend LED).
+    closed = list(response_module.closed_peer_set(db, params.uuids))
+    return {"online": online, "inactive": inactive, "blocked": blocked, "closed": closed}
 
 # Permanently blocks a peer for this user: marks (or creates) their user_user link is_active = 0, so
 # the combination disappears from nearby + friends and can no longer wake either side. X-API-Key only.
@@ -1394,6 +1402,17 @@ async def delete_group(params: RequestGroupId, db: Session = Depends(get_db)):
 async def activate_user(params: RequestActivateUser, db: Session = Depends(get_db)):
     try:
         return response_module.activate_user(db, params.uuid, params.is_active)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Sets the user's "open to making new friends" flag (is_open_for_new). When 0, other peers hide this user
+# from their Nearby list unless they're already friends. X-API-Key only.
+@app.post("/v1/update_open_to_friends/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def update_open_to_friends(params: RequestUpdateOpenToFriends, db: Session = Depends(get_db)):
+    try:
+        return response_module.update_open_to_friends(db, params.uuid, params.is_open_for_new)
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:

@@ -354,64 +354,6 @@ WHERE p.is_active = 0 AND ph.uuid = :phone_uuid
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
-def get_share_request(db: Session, link_id):
-    query = text("""
-    SELECT sr.phone_uuid, sr.peripheral_ble_id, sr.peripheral_name, sr.reference, sr.uses_left 
-        FROM share_request sr 
-    JOIN phone ph ON ph.uuid = sr.phone_uuid 
-    WHERE sr.link_id = :link_id AND sr.is_active = 1 AND ph.is_active = 1 AND sr.valid_from <= NOW() AND NOW() <= sr.valid_to AND sr.uses_left > 0    
-    """)
-
-    try:
-        request_row = db.execute(query, {"link_id": link_id}).mappings().fetchone()
-        if request_row:
-            return request_row
-        else:
-            raise Exception("Invalid request")
-
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"Database error: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Exception error: {str(e)}")
-
-async def open_remote(db: Session, ble_id: str, phone_uuid: str, email: str, constants: dict):
-    err_message = ""
-    result = False
-
-    query = text("""
-SELECT UNIQUE pbu.peripheral_ble_id AS ble_id FROM peripheral_bell_user pbu
-LEFT JOIN phone_peripheral pp ON pbu.peripheral_ble_id = pp.peripheral_ble_id
-WHERE pbu.is_active = 1 AND pp.phone_uuid = :phone_uuid AND pbu.peripheral_ble_id = :ble_id
-    """)
-    try:
-        if db.execute(query, {"ble_id": ble_id, "phone_uuid": phone_uuid}).mappings().fetchone():
-            result = open_bellxs_lock(db, ble_id, email)
-        else:
-            query = text("""
-            SELECT p.seed, p.totp_secret, p.name, p.sig_duration
-            FROM peripheral p JOIN user_peripheral up ON p.ble_id = up.peripheral_ble_id  JOIN user u ON u.uuid = up.user_id
-            WHERE p.ble_id = :ble_id
-            AND u.phone_uuid = :phone_uuid
-            AND (up.is_active = 1 AND p.is_active = 1
-                AND (up.valid_from <= NOW() OR up.valid_from IS NULL) AND (NOW() <= up.valid_to OR up.valid_to IS NULL)
-                OR up.is_admin = 1)
-            """)
-            peripheral_row = db.execute(query, {"ble_id": ble_id, "phone_uuid": phone_uuid}).mappings().fetchone()
-            if peripheral_row: # or link_id == "bbcde12345xyz":
-                crypt_obj = SafeXSCrypt(peripheral_row["seed"], peripheral_row["totp_secret"], constants)
-                payload = crypt_module.get_online_unlock(crypt_obj, int(time.time()), phone_uuid, peripheral_row["sig_duration"])
-                payload = crypt_module.encrypt(crypt_obj, payload)
-                result = (await handle_open(payload, ble_id) < 7)
-                if not result:
-                    err_message = "Device transmission failed"
-
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"Database error: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Exception error: {str(e)}")
-    finally:
-        return ResponseResult(success=result, error=err_message)
-
 def set_share_link(db: Session, ble_id, phone_uuid, valid_from, valid_to, uses_limit, reference, constants: dict):
     query = text("""
     SELECT p.name FROM peripheral p WHERE p.ble_id = :ble_id
@@ -1459,6 +1401,63 @@ def active_status(db: Session, peer_hexes):
             status[by_uuid[key]] = bool(row["is_active"])
     return status
 
+def closed_peer_set(db: Session, peer_hexes):
+    """Returns the subset of peer_hexes that are NOT open to making new friends (user.is_open_for_new = 0),
+    so peers_online can tell the app to hide them from Nearby (the app keeps ones that are already friends).
+    ONE round-trip, mirroring active_status. Peers whose row is missing the column/value are treated as OPEN
+    (not returned) so nothing is hidden by accident."""
+    by_uuid = {}
+    for peer_hex in peer_hexes:
+        try:
+            b = bytes.fromhex(peer_hex)
+        except (ValueError, TypeError):
+            continue
+        if len(b) == 16:
+            by_uuid[b] = peer_hex
+    if not by_uuid:
+        return set()
+    keys = list(by_uuid.keys())
+    placeholders = ", ".join(f":u{i}" for i in range(len(keys)))
+    bind = {f"u{i}": k for i, k in enumerate(keys)}
+    rows = db.execute(
+        text(f"SELECT uuid, is_open_for_new FROM user WHERE uuid IN ({placeholders})"),
+        bind,
+    ).mappings().all()
+    closed = set()
+    for row in rows:
+        key = bytes(row["uuid"])
+        val = row["is_open_for_new"]
+        # Only an EXPLICIT 0 hides a peer. NULL / missing → treated as OPEN, so a pre-existing user whose
+        # column was never set can't accidentally disappear from everyone's Nearby list.
+        if key in by_uuid and val is not None and not bool(val):
+            closed.add(by_uuid[key])
+    return closed
+
+def update_open_to_friends(db: Session, user_hex: str, is_open: bool):
+    """Sets a peer's is_open_for_new flag (open to making new friends = discoverable by nearby non-friends).
+    X-API-Key only. Mirrors activate_user; does NOT filter on any flag so it always applies."""
+    try:
+        try:
+            user_uuid = bytes.fromhex(user_hex)
+        except ValueError:
+            raise Exception("Invalid uuid")
+        if len(user_uuid) != 16:
+            raise Exception("Invalid uuid")
+
+        result = db.execute(
+            text("UPDATE user SET is_open_for_new = :open WHERE uuid = :uuid"),
+            {"open": 1 if is_open else 0, "uuid": user_uuid},
+        )
+        db.commit()
+        if result.rowcount == 0:
+            raise Exception("Peer not found")
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
 def activate_user(db: Session, user_hex: str, is_active: bool):
     """Sets a peer's is_active flag (Peers-mode active = discoverable). X-API-Key only. Deliberately
     does NOT filter on is_active in the WHERE clause so an already-inactive user can re-activate.
@@ -2304,56 +2303,6 @@ def login_panel(db: Session, username, password, phone_uuid, constants: dict):
         #print(f"Exception: {e}")
         raise Exception(f"Exception error: {str(e)}")
 
-def get_bell_panel(db: Session, user_id):
-    query = text("""
-    SELECT UNIQUE b.id, b.id_label, b.label, b.phone, bp.name as bell_panel_name, bp.peripheral_ble_id, u.is_super_admin
-    FROM bell b 
-    JOIN bell_panel bp ON b.bell_panel_id = bp.id
-    JOIN user u ON u.bell_panel_id = bp.id
-    WHERE u.uuid = :user_id 
-    """)
-    try:
-        return db.execute(query, {"user_id": user_id}).mappings().fetchall()
-
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"Database error: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Exception error: {str(e)}")
-
-    # SELECT UNIQUE b.id, b.label, b.phone
-    # FROM bell b
-    # JOIN peripheral_bell_user pbu ON b.id = pbu.bell_id
-    # WHERE pbu.peripheral_ble_id =
-    # (SELECT up.peripheral_ble_id
-    # FROM user_peripheral up
-    # WHERE up.user_id = :user_id
-    # LIMIT 1) AND
-    # pbu.is_active = 1
-
-def get_user_id (db: Session, email: str) -> bool:
-    query = text("""
-     SELECT uuid, bell_panel_id FROM user WHERE email = :email AND is_active = 1 AND bell_panel_id IS NOT NULL AND bell_panel_id > 0;
-     """)
-    try:
-        return db.execute(query, {"email": email}).mappings().fetchone()
-
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"Database error: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Exception error: {str(e)}")
-
-def check_is_bell_panel(db: Session, email: str) -> bool:
-    query = text("""
-     SELECT uuid, bell_panel_id FROM user WHERE email = :email AND is_active = 1 AND bell_panel_id IS NOT NULL AND bell_panel_id > 0;
-     """)
-    try:
-        return db.execute(query, {"email": email}).mappings().fetchone()
-
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"Database error: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Exception error: {str(e)}")
-
 def store_fcm_token(db: Session, user_id: int, token: str):
     update_query = text("""
     UPDATE user SET fcm_token = :token WHERE uuid = :user_id
@@ -2367,45 +2316,6 @@ def store_fcm_token(db: Session, user_id: int, token: str):
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
-# Sends a silent data-only message to an Android device to trigger the openDoor method
-def open_bellxs_lock(db: Session, ble_id: str, email: str):
-    if app_bellxs is None:   # BellXS Firebase not configured (peers-only deployment)
-        return False
-    query = text("""
-    SELECT u.fcm_token, bp.peripheral_ble_id
-    FROM user u 
-    JOIN bell_panel bp ON bp.id = u.bell_panel_id 
-    WHERE bp.peripheral_ble_id = :ble_id AND bp.is_active = 1
-    """)
-    try:
-        result = db.execute(query, {"ble_id": ble_id}).mappings().fetchone()
-        fcm_token = result["fcm_token"]
-        ble_id = result["peripheral_ble_id"]
-        if fcm_token:
-            print(f"Attempting to send 'OPEN_DOOR' command with token: {fcm_token} for user: {email} and {ble_id}")
-            # Construct the data payload.
-            message = messaging.Message(
-                data = {"action": "OPEN_DOOR", "email": email, "ble_id": ble_id},
-                token = fcm_token,
-                # Set Android-specific priority to 'high' to ensure delivery
-                # even in Doze mode (within limits).
-                android=messaging.AndroidConfig(
-                    priority="high"
-                )
-            )
-            # Send the message
-            response = messaging.send(message, app=app_bellxs)
-            print("Successfully sent message:", response)
-            return True
-        else:
-            raise HTTPException(status_code=status.HTTP_412_PRECONDITION_FAILED, detail="No bell panel configured for this peripheral")
-
-    except HTTPException as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
-    except SQLAlchemyError as e:
-        raise RuntimeError(f"Database error: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Exception error: {str(e)}")
 
 # Sends a silent data-only message to an Android device to trigger the openDoor method
 def notify_safexs_doorbell(db: Session, bell_id: int, image_filename: str = ""):
