@@ -2111,7 +2111,7 @@ async def get_chat_video_cover(params: RequestGetChatVideo, db: Session = Depend
 # uploaded once to static/chat_media/<media_id>.<ext>, referenced by docId in the chat message (with
 # docName/docSize riding the frame), so a killed/offline receiver can still fetch them later.
 
-CHAT_DOC_EXTS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "pages", "numbers"}
+CHAT_DOC_EXTS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "pages", "numbers", "key"}
 MAX_CHAT_DOC_B64 = int(os.environ.get("PEERS_MAX_DOC_B64", str(34 * 1024 * 1024)))   # ≈25MB decoded
 
 @app.post("/v1/upload_chat_doc/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
