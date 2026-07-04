@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import json
 import os
 import ssl
 import threading
@@ -167,12 +168,44 @@ def _op_size(data: dict) -> int:
 # Global cap on cached live-location last-positions (one per active share per target). Bounded so a flood
 # of live shares can't grow memory without limit.
 MAX_LIVE_POSITIONS = int(os.environ.get("PEERS_MAX_LIVE_POSITIONS", "20000"))
+# Multi-device echo catch-up queue: frames a sender's OFFLINE sibling device (killed Mac / killed
+# iPhone) receives on reconnect, so its own sent messages appear there too. Bounded per device and
+# globally (echo frames can carry base64 photos/audio).
+MAX_ECHO_FRAMES_PER_DEVICE = int(os.environ.get("PEERS_MAX_ECHO_FRAMES", "200"))
+MAX_ECHO_BYTES = int(os.environ.get("PEERS_MAX_ECHO_BYTES", str(64 * 1024 * 1024)))
+# The echo queue is ALSO persisted to disk so pending catch-ups survive a backend restart:
+# one JSON file per queued frame per waiting device, named
+#   <unix_ms>-<seq>_<uuidSender>_<uuidReceiver>_<deviceId>.json
+# (file exists == that device still needs that frame; deleted once flushed). NOTE: static/ is NOT
+# mounted as a public StaticFiles route — files there are only reachable through explicit endpoints —
+# so the cache is not downloadable. Keep it that way if a static mount is ever added.
+ECHO_CACHE_DIR = "static/message_cache"
+ECHO_CACHE_MAX_AGE = float(os.environ.get("PEERS_ECHO_MAX_AGE_DAYS", "14")) * 86400
 
 # Store active connections: bell_id -> WebSocket
 class ConnectionManager:
     def __init__(self):
-        # We store connections mapped by a unique ID (e.g., "bell_101", "safe_user_5")
-        self.active_connections: Dict[str, WebSocket] = {}
+        # Connections mapped by a unique ID (e.g. a peer uuid). MULTI-DEVICE: one user identity can be
+        # signed in on several devices (iPhone + Mac sharing the peer uuid via iCloud Keychain), so each
+        # ID maps to {device_id: WebSocket}. Deliveries fan out to ALL of the target's sockets unless the
+        # message pins a specific device via "targetDevice" (used by call signaling so the SDP/ICE
+        # handshake stays on the device that initiated/answered the call).
+        self.active_connections: Dict[str, Dict[str, WebSocket]] = {}
+        # Per-device metadata: {"platform": "phone"|"mac", "echo": bool}. `platform` decides whether a
+        # live delivery counts as reaching the user's PHONE (pushes still fire when only a Mac got it);
+        # `echo` marks devices that understand self-echo frames (old clients never opt in).
+        self.device_meta: Dict[str, Dict[str, dict]] = {}
+        # Devices we've EVER seen for a uuid (kept across disconnects — device ids are stable:
+        # identifierForVendor on iOS, a persisted UUID on macOS). Lets the echo queue target a
+        # sibling device that's currently offline. Mirrored to ECHO_CACHE_DIR/_known_devices.json
+        # so a restart doesn't forget which siblings exist.
+        self.known_devices: Dict[str, Dict[str, dict]] = {}
+        # uuid -> device -> deque[(frame, size, path)] of echo frames awaiting that device's
+        # reconnect. Each frame is mirrored to a file in ECHO_CACHE_DIR (see above) so pending
+        # catch-ups survive a backend restart; `path` is that file, removed once flushed/evicted.
+        self.echo_queue: Dict[str, Dict[str, deque]] = {}
+        self._echo_bytes = 0
+        self._echo_seq = 0
         # Per-receiver app-icon badge counter for offline friend-message pushes. Incremented on each
         # such push (carried in aps.badge), reset when the receiver reconnects (back online/foreground).
         self.pending_badge: Dict[str, int] = {}
@@ -191,12 +224,26 @@ class ConnectionManager:
         # to the target on reconnect so a backgrounded/returning receiver sees an up-to-date pin.
         self.live_positions: Dict[str, dict] = {}
         self._live_count = 0
+        # Restore frames (and the known-device map) persisted before the last backend restart.
+        self._load_echo_cache()
 
-    async def connect(self, client_id: str, websocket: WebSocket):
+    async def connect(self, client_id: str, websocket: WebSocket, device: str = "default",
+                      platform: str = "phone", echo: bool = False):
         await websocket.accept()
-        self.active_connections[client_id] = websocket
+        self.active_connections.setdefault(client_id, {})[device] = websocket
+        self.device_meta.setdefault(client_id, {})[device] = {"platform": platform, "echo": echo}
+        # Remember this device for offline echo targeting (cap the remembered set per uuid).
+        known = self.known_devices.setdefault(client_id, {})
+        known[device] = {"platform": platform, "echo": echo, "seen": time.time()}
+        while len(known) > 8:
+            oldest = min(known, key=lambda d: known[d].get("seen", 0))
+            known.pop(oldest, None)
+            for _, s0, p0 in ((self.echo_queue.get(client_id) or {}).pop(oldest, None) or []):
+                self._echo_bytes -= s0
+                self._delete_frame(p0)
+        self._persist_devices()
         self.pending_badge.pop(client_id, None)   # back online → clear the app-icon badge counter
-        print(f"Client connected: {client_id}")
+        print(f"Client connected: {client_id} [device {device[:8]}]")
         # Deliver any control ops queued while this peer was offline (e.g. a Sender deleted a message
         # while the receiver had the app killed).
         seqs = self.pending_by_peer.pop(client_id, None)
@@ -209,7 +256,9 @@ class ConnectionManager:
                     ops.append(entry[1])
             for op in ops:
                 try:
-                    await websocket.send_json(op)
+                    # queuedFlush → the app knows this is a reconnect catch-up, NOT a live message:
+                    # the offline push already showed the banner, so no local banner on top of it.
+                    await websocket.send_json({**op, "queuedFlush": True})
                 except Exception as e:
                     print(f"flush pending op to {client_id[:8]} failed: {e}")
                     break
@@ -224,11 +273,32 @@ class ConnectionManager:
                 if lu and lu < now:
                     continue
                 try:
-                    await websocket.send_json(d)
+                    await websocket.send_json({**d, "queuedFlush": True})
                 except Exception as e:
                     print(f"flush live position to {client_id[:8]} failed: {e}")
                     break
             print(f"flushed live position(s) to {client_id[:8]}")
+        # Deliver echo frames queued for THIS device while it was offline (its own messages sent from
+        # the sibling device) — silent catch-up, no push, de-duped client-side by msgId.
+        dq = (self.echo_queue.get(client_id) or {}).pop(device, None)
+        if dq:
+            sent = 0
+            while dq:
+                frame, size, path = dq[0]
+                try:
+                    await websocket.send_json({**frame, "queuedFlush": True})
+                except Exception as e:
+                    print(f"flush echo to {client_id[:8]}[{device[:8]}] failed: {e}")
+                    # keep the remainder queued (it is still on disk) for the next reconnect
+                    self.echo_queue.setdefault(client_id, {})[device] = dq
+                    break
+                dq.popleft()
+                self._echo_bytes -= size
+                self._delete_frame(path)   # delivered → its cache file is no longer needed
+                sent += 1
+            if not self.echo_queue.get(client_id):
+                self.echo_queue.pop(client_id, None)
+            print(f"flushed {sent} echo frame(s) to {client_id[:8]}[{device[:8]}]")
 
     def cache_live(self, target_id: str, data: dict):
         mid = data.get("msgId")
@@ -248,6 +318,136 @@ class ConnectionManager:
             self._live_count -= 1
             if not bucket:
                 self.live_positions.pop(target_id, None)
+
+    def enqueue_echo(self, client_id: str, data: dict, exclude_device: str = None):
+        """Queue a chat frame for `client_id`'s KNOWN, echo-capable devices that are currently
+        OFFLINE — used for BOTH the sender's own echo (their killed sibling shows what they sent) and
+        the TARGET's offline siblings (a killed Mac still receives what the iPhone got live, incl.
+        video/photo payloads). Flushed per device on reconnect; clients de-dup by msgId. Bounded FIFO
+        per device + a global byte cap (frames may carry media). Every queued frame is mirrored to a
+        file in ECHO_CACHE_DIR so pending catch-ups survive a backend restart."""
+        known = self.known_devices.get(client_id) or {}
+        online = set((self.active_connections.get(client_id) or {}).keys())
+        size = _op_size(data)
+        for dev, meta in known.items():
+            if dev == exclude_device or dev in online or not meta.get("echo"):
+                continue
+            path = self._persist_frame(client_id, dev, data)
+            dq = self.echo_queue.setdefault(client_id, {}).setdefault(dev, deque())
+            dq.append((data, size, path))
+            self._echo_bytes += size
+            while len(dq) > MAX_ECHO_FRAMES_PER_DEVICE:
+                _, s0, p0 = dq.popleft()
+                self._echo_bytes -= s0
+                self._delete_frame(p0)
+        self._evict_echo_over_byte_cap()
+
+    def _evict_echo_over_byte_cap(self):
+        """Global echo byte cap: evict the oldest frames across all queues (disk file included)."""
+        while self._echo_bytes > MAX_ECHO_BYTES:
+            evicted = False
+            for uid, devs in list(self.echo_queue.items()):
+                for d, q in list(devs.items()):
+                    if q:
+                        _, s0, p0 = q.popleft()
+                        self._echo_bytes -= s0
+                        self._delete_frame(p0)
+                        evicted = True
+                        if not q:
+                            devs.pop(d, None)
+                        break
+                if not devs:
+                    self.echo_queue.pop(uid, None)
+                if evicted:
+                    break
+            if not evicted:
+                break
+
+    # ---- echo-queue disk persistence (ECHO_CACHE_DIR) ----
+
+    def _persist_frame(self, receiver: str, device: str, data: dict) -> str:
+        """Mirror a queued frame to <unix_ms>-<seq>_<sender>_<receiver>_<device>.json (written via a
+        temp file + atomic rename so a crash can't leave a half-written frame). Best-effort: on a
+        disk error the frame still rides the in-memory queue, it just won't survive a restart."""
+        try:
+            self._echo_seq += 1
+            sender = str(data.get("sender") or "unknown")
+            name = f"{int(time.time() * 1000)}-{self._echo_seq:06d}_{sender}_{receiver}_{device}.json"
+            path = os.path.join(ECHO_CACHE_DIR, name)
+            with open(path + ".tmp", "w") as f:
+                json.dump(data, f, separators=(",", ":"))
+            os.replace(path + ".tmp", path)
+            return path
+        except Exception as e:
+            print(f"echo cache write failed: {e}")
+            return ""
+
+    @staticmethod
+    def _delete_frame(path: str):
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _persist_devices(self):
+        """Mirror known_devices to _known_devices.json so a restarted backend still knows which
+        offline siblings to queue for (before they have reconnected once)."""
+        try:
+            tmp = os.path.join(ECHO_CACHE_DIR, "_known_devices.json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(self.known_devices, f)
+            os.replace(tmp, os.path.join(ECHO_CACHE_DIR, "_known_devices.json"))
+        except Exception as e:
+            print(f"echo cache devices write failed: {e}")
+
+    def _load_echo_cache(self):
+        """Startup: rebuild the in-memory echo queue from the persisted frames. Filenames start with
+        a ms timestamp, so lexicographic order == chronological order. Frames older than
+        ECHO_CACHE_MAX_AGE (device presumably gone for good) are dropped, and the usual per-device /
+        global caps are re-applied."""
+        os.makedirs(ECHO_CACHE_DIR, exist_ok=True)
+        try:
+            with open(os.path.join(ECHO_CACHE_DIR, "_known_devices.json")) as f:
+                self.known_devices = json.load(f)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"echo cache devices load failed: {e}")
+        now = time.time()
+        loaded = dropped = 0
+        for name in sorted(os.listdir(ECHO_CACHE_DIR)):
+            if name.startswith("_") or not name.endswith(".json"):
+                continue
+            path = os.path.join(ECHO_CACHE_DIR, name)
+            try:
+                stem = name[:-5]
+                ts_ms = int(stem.split("-", 1)[0])
+                # uuids/device ids never contain "_", so rsplit safely peels receiver + device
+                # off the end whatever the sender field held.
+                _, receiver, device = stem.rsplit("_", 2)
+                if ECHO_CACHE_MAX_AGE and now - ts_ms / 1000 > ECHO_CACHE_MAX_AGE:
+                    os.remove(path)
+                    dropped += 1
+                    continue
+                with open(path) as f:
+                    data = json.load(f)
+                size = _op_size(data)
+                dq = self.echo_queue.setdefault(receiver, {}).setdefault(device, deque())
+                dq.append((data, size, path))
+                self._echo_bytes += size
+                loaded += 1
+                while len(dq) > MAX_ECHO_FRAMES_PER_DEVICE:
+                    _, s0, p0 = dq.popleft()
+                    self._echo_bytes -= s0
+                    self._delete_frame(p0)
+                    loaded -= 1
+                    dropped += 1
+            except Exception as e:
+                print(f"echo cache skip {name}: {e}")
+        self._evict_echo_over_byte_cap()
+        if loaded or dropped:
+            print(f"echo cache: restored {loaded} frame(s), dropped {dropped}")
 
     def enqueue(self, target_id: str, data: dict):
         self._op_seq += 1
@@ -276,15 +476,57 @@ class ConnectionManager:
         self.pending_badge[client_id] = self.pending_badge.get(client_id, 0) + 1
         return self.pending_badge[client_id]
 
-    def disconnect(self, client_id: str):
-        if client_id in self.active_connections:
+    def disconnect(self, client_id: str, device: str = None, websocket: WebSocket = None):
+        """Remove one device's socket (by device id and/or the socket object), or ALL of the
+        client's sockets when neither is given (legacy behaviour for stale-socket cleanup)."""
+        socks = self.active_connections.get(client_id)
+        if not socks:
+            return
+        if device is None and websocket is None:
             del self.active_connections[client_id]
-            print(f"Client disconnected: {client_id}")
+            self.device_meta.pop(client_id, None)
+            print(f"Client disconnected: {client_id} (all devices)")
+            return
+        for dev in [d for d, w in list(socks.items()) if d == device or w is websocket]:
+            socks.pop(dev, None)
+            self.device_meta.get(client_id, {}).pop(dev, None)
+            print(f"Client disconnected: {client_id} [device {dev[:8]}]")
+        if not socks:
+            self.active_connections.pop(client_id, None)
+            self.device_meta.pop(client_id, None)
+
+    async def send_all(self, client_id: str, message: dict, target_device: str = None,
+                       exclude_ws: WebSocket = None, echo_capable_only: bool = False):
+        """Deliver to the target's device sockets: all of them, or only `target_device` when pinned.
+        `exclude_ws` skips the originating socket (self-fan-out to one's own other devices);
+        `echo_capable_only` restricts to devices that opted into self-echo frames (new clients).
+        Stale sockets are dropped. Returns (delivered_any, delivered_phone) — the latter is True only
+        when a NON-mac device got the message, so push decisions can still reach the user's phone
+        while a Mac keeps the uuid "online"."""
+        delivered_any = False
+        delivered_phone = False
+        socks = self.active_connections.get(client_id) or {}
+        meta = self.device_meta.get(client_id) or {}
+        for dev, ws in list(socks.items()):
+            if target_device and dev != target_device:
+                continue
+            if exclude_ws is not None and ws is exclude_ws:
+                continue
+            if echo_capable_only and not (meta.get(dev) or {}).get("echo"):
+                continue
+            try:
+                await ws.send_json(message)
+                delivered_any = True
+                if (meta.get(dev) or {}).get("platform", "phone") != "mac":
+                    delivered_phone = True
+            except Exception as e:
+                print(f"send to {client_id[:8]}[{dev[:8]}] failed ({e}); dropping stale socket")
+                self.disconnect(client_id, device=dev)
+        return delivered_any, delivered_phone
 
     async def send_personal_message(self, message: dict, client_id: str):
-        if client_id in self.active_connections:
-            await self.active_connections[client_id].send_json(message)
-        else:
+        any_dev, _ = await self.send_all(client_id, message)
+        if not any_dev:
             print(f"Target {client_id} not connected/found.")
 
 
@@ -295,7 +537,8 @@ manager = ConnectionManager()
 # Add the logging middleware to the app
 # app.add_middleware(LogMiddleware)
 
-async def relay_group_message(client_id: str, data: dict, msg_type: str):
+async def relay_group_message(client_id: str, data: dict, msg_type: str, origin_ws: WebSocket = None,
+                              origin_device: str = None):
     """Fans a GROUP_MESSAGE / GROUP_EDIT / GROUP_DELETE out to every other member of the group: a live
     socket send when the member is online, otherwise queued for their reconnect (so a killed member still
     gets it) plus — for a new GROUP_MESSAGE — a visible FCM push. Membership (not friendship) authorises
@@ -312,27 +555,30 @@ async def relay_group_message(client_id: str, data: dict, msg_type: str):
                 _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
             for member_id in members:
                 if member_id == client_id:
+                    # Self-echo: mirror the sender's own group message to their OTHER devices —
+                    # live now, queued for an offline sibling's reconnect.
+                    await manager.send_all(client_id, data, exclude_ws=origin_ws, echo_capable_only=True)
+                    manager.enqueue_echo(client_id, data, exclude_device=origin_device)
                     continue
-                delivered = False
-                ws = manager.active_connections.get(member_id)
-                if ws is not None:
-                    try:
-                        await ws.send_json(data)
-                        delivered = True
-                    except Exception as e:
-                        print(f"relay group: send to {member_id[:8]} failed ({e}); dropping stale socket")
-                        manager.disconnect(member_id)
-                if not delivered:
-                    # Queue for reconnect (so the killed member still gets it) and, for a new message,
-                    # raise a visible push — but NOT for a system line (created/welcome/left).
+                delivered_any, delivered_phone = await manager.send_all(member_id, data)
+                # Per-device catch-up for the member's offline sibling devices (e.g. a killed Mac
+                # whose iPhone received the live copy). De-duped client-side by msgId.
+                manager.enqueue_echo(member_id, data)
+                if not delivered_any:
+                    # Legacy per-uuid queue for members with no known devices (e.g. after a restart).
                     manager.enqueue(member_id, data)
+                if not delivered_phone:
+                    # Raise a visible push when the member's PHONE didn't get a live copy — but NOT
+                    # for a system line (created/welcome/left).
                     if msg_type == "GROUP_MESSAGE" and not data.get("groupSystem"):
                         fcm_token, _, _ = response_module.get_peer_push_info(s, member_id)
                         if fcm_token:
                             badge = manager.next_badge(member_id)
+                            push_text = data.get("text") or (
+                                "📄 " + (data.get("docName") or "Document") if data.get("docId") else "")
                             response_module.send_group_message_push(
                                 fcm_token, client_id, sender_name, str(group_id),
-                                data.get("groupName") or "", data.get("text") or "",
+                                data.get("groupName") or "", push_text,
                                 badge, data.get("msgId") or "")
         finally:
             s.close()
@@ -342,7 +588,12 @@ async def relay_group_message(client_id: str, data: dict, msg_type: str):
 
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
-    await manager.connect(client_id, websocket)
+    # Optional per-device id (?device=…): lets one peer identity hold several live sockets
+    # (iPhone + Mac). Old clients without it land on "default" (single-device semantics).
+    device = websocket.query_params.get("device") or "default"
+    platform = websocket.query_params.get("platform") or "phone"
+    echo = websocket.query_params.get("echo") == "1"
+    await manager.connect(client_id, websocket, device, platform=platform, echo=echo)
     try:
         while True:
             # Receive JSON data (Offer, Answer, or Candidate)
@@ -351,16 +602,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             # Group chat messages have no single target — the relay fans them out to all members.
             if data.get("type") in ("GROUP_MESSAGE", "GROUP_EDIT", "GROUP_DELETE"):
                 data["sender"] = client_id
-                await relay_group_message(client_id, data, data.get("type"))
+                await relay_group_message(client_id, data, data.get("type"), origin_ws=websocket,
+                                          origin_device=device)
                 continue
 
             # The client must specify who the message is for
             target_id = data.get("target")
 
             if target_id:
-                # Forward the exact message to the target peer (stamping the sender so the
-                # recipient knows who it's from).
+                # Forward the exact message to the target peer (stamping the sender + device so the
+                # recipient knows who it's from and can pin call-signaling replies to that device).
                 data["sender"] = client_id
+                data["senderDevice"] = device
                 msg_type = data.get("type")
                 print(f"relay {client_id} → {target_id}: {msg_type}")
 
@@ -397,13 +650,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # The queue is byte-bounded (MAX_PENDING_BYTES), so queued photos can't exhaust memory.
                 if (msg_type == "CHAT_MESSAGE" and not data.get("liveUntil")
                         and (data.get("contactCard") or data.get("imageData") or data.get("audioData")
-                             or data.get("latitude") is not None)):
+                             or data.get("videoId") or data.get("docId") or data.get("latitude") is not None)):
                     try:
                         s_q = database.create_session()
                         try:
                             if response_module.are_friends(s_q, client_id, target_id):
                                 manager.enqueue(target_id, data)
                                 kind = ("photo" if data.get("imageData") else "audio" if data.get("audioData")
+                                        else "video" if data.get("videoId")
+                                        else "document" if data.get("docId")
                                         else "contact" if data.get("contactCard") else "location")
                                 print(f"relay: queued {kind} for {target_id[:8]}")
                         finally:
@@ -411,21 +666,31 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     except Exception as e:
                         print(f"relay queue media error: {e}")
 
-                # Try a live delivery first. A killed app may leave a stale socket in
-                # active_connections (its disconnect not yet detected); sending into it raises,
-                # so we drop it and fall through to the FCM push instead of silently losing the
-                # request.
-                delivered = False
-                ws = manager.active_connections.get(target_id)
-                if ws is not None:
-                    try:
-                        await ws.send_json(data)
-                        delivered = True
-                    except Exception as e:
-                        print(f"relay: send to {target_id[:8]} failed ({e}); dropping stale socket")
-                        manager.disconnect(target_id)
+                # Try a live delivery first — to ALL of the target's device sockets (or only the
+                # pinned one when the message carries targetDevice). Self-fan-out (target == sender,
+                # e.g. CALL_TAKEN telling one's own other devices) excludes the originating socket.
+                delivered_any, delivered_phone = await manager.send_all(
+                    target_id, data,
+                    target_device=data.get("targetDevice"),
+                    exclude_ws=websocket if target_id == client_id else None)
 
-                if not delivered:
+                # MULTI-DEVICE ECHO: mirror chat state to the SENDER's other (echo-capable) devices,
+                # so an iPhone + Mac sharing one uuid show the same conversation. Old clients never
+                # opt in, so they never see these frames.
+                if target_id != client_id and msg_type in (
+                        "CHAT_MESSAGE", "CHAT_EDIT", "CHAT_DELETE", "CHAT_READ", "CHAT_CLEAR",
+                        "LOCATION_UPDATE", "LOCATION_STOP"):
+                    await manager.send_all(client_id, data, exclude_ws=websocket, echo_capable_only=True)
+                    # The SENDER's offline sibling (killed Mac / killed iPhone) catches up on reconnect…
+                    manager.enqueue_echo(client_id, data, exclude_device=device)
+                    # …and so does the TARGET's offline sibling: its online device (or the push) got the
+                    # message, but e.g. a killed Mac has no push and the legacy per-uuid queue is popped
+                    # by whichever device reconnects first — this per-device queue is theirs alone.
+                    manager.enqueue_echo(target_id, data)
+
+                # Push when the user's PHONE didn't get a live copy (a Mac-only delivery must not
+                # swallow the phone's banner/ring — and previously it silenced the phone entirely).
+                if not delivered_phone:
                     # A friend's chat message to an offline/backgrounded peer → VISIBLE "new message"
                     # push: banner (title=sender, body=text) + system sound + app-icon badge, carrying
                     # the text + msgId so the app stores it (de-dup). Only between friends (a non-friend
@@ -439,9 +704,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
                                     if fcm_token:
                                         badge = manager.next_badge(target_id)
+                                        # Banner fallback for caption-less media (the data.text stays the REAL
+                                        # caption — the app stores it as the message text).
+                                        kind_label = ("📹 Video" if data.get("videoId")
+                                                      else "📄 " + (data.get("docName") or "Document") if data.get("docId")
+                                                      else "📷 Photo" if data.get("imageData")
+                                                      else "🎤 Voice message" if data.get("audioData")
+                                                      else "👤 Contact" if data.get("contactCard")
+                                                      else "📍 Location" if data.get("latitude") is not None else "")
                                         ok = response_module.send_chat_message_push(
                                             fcm_token, client_id, sender_name,
-                                            data.get("text") or "", badge, data.get("msgId") or "")
+                                            data.get("text") or "", badge, data.get("msgId") or "",
+                                            video_id=data.get("videoId") or "", kind_label=kind_label)
                                         print(f"relay: chat-msg push to {target_id[:8]} sent={ok} badge={badge}")
                                     else:
                                         print(f"relay: offline friend {target_id[:8]} has no push token")
@@ -516,7 +790,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 s.close()
                         except Exception as e:
                             print(f"relay group-call push error: {e}")
-                    elif msg_type in ("CHAT_EDIT", "CHAT_DELETE", "CHAT_READ"):
+                    elif msg_type in ("CHAT_EDIT", "CHAT_DELETE", "CHAT_READ", "CHAT_CLEAR"):
                         # Hold the edit/delete/read-receipt and deliver it when the (killed/offline) target
                         # returns, so the Sender's edit/delete still applies — and a CHAT_READ (receiver
                         # opened the chat) reaches the offline sender so their check turns green on reconnect.
@@ -527,7 +801,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         print(f"relay: target {target_id[:8]} offline; dropping {msg_type}")
 
     except WebSocketDisconnect:
-        manager.disconnect(client_id)
+        manager.disconnect(client_id, device=device, websocket=websocket)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 templates = Jinja2Templates(directory="templates")
@@ -625,6 +899,19 @@ class RequestGetChatVideo(BaseModel):
 
 class RequestDeleteChatVideo(BaseModel):
     media_id: str               # the id whose file (+ poster) to delete
+    uuid: str                   # the authenticated caller (the sender deleting their own message)
+
+class RequestUploadChatDoc(BaseModel):
+    uuid: str                   # the sender (authenticated)
+    doc_data: str               # base64 document bytes
+    doc_ext: str                # extension (whitelisted: pdf/doc/docx/xls/xlsx/ppt/pptx/txt/pages/numbers)
+
+class RequestGetChatDoc(BaseModel):
+    media_id: str               # the id returned by upload_chat_doc
+    caller_uuid: str            # the authenticated requester
+
+class RequestDeleteChatDoc(BaseModel):
+    media_id: str               # the id whose file to delete
     uuid: str                   # the authenticated caller (the sender deleting their own message)
 
 # A profile VIDEO is just another "about me" item in image_order: stored as <uuid>-<seq>.mp4 with a poster
@@ -1372,15 +1659,8 @@ async def delete_group(params: RequestGroupId, db: Session = Depends(get_db)):
             for m in members:
                 if m == params.uuid:
                     continue
-                ws = manager.active_connections.get(m)
-                delivered = False
-                if ws is not None:
-                    try:
-                        await ws.send_json(notice)
-                        delivered = True
-                    except Exception:
-                        manager.disconnect(m)
-                if not delivered:
+                delivered_any, _ = await manager.send_all(m, notice)
+                if not delivered_any:
                     manager.enqueue(m, notice)
         except Exception as notify_err:
             print(f"delete_group notify error: {notify_err}")
@@ -1817,6 +2097,61 @@ async def get_chat_video_cover(params: RequestGetChatVideo, db: Session = Depend
             return {"success": True, "cover_data": "", "error": ""}   # no poster → empty, not an error
         with open(path, "rb") as f:
             return {"success": True, "cover_data": base64.b64encode(f.read()).decode("ascii"), "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+# --- Document media ---------------------------------------------------------------------------------
+# Chat documents (Word/Excel/PDF/PowerPoint/Text/Pages/Numbers) follow the video pattern (option B):
+# uploaded once to static/chat_media/<media_id>.<ext>, referenced by docId in the chat message (with
+# docName/docSize riding the frame), so a killed/offline receiver can still fetch them later.
+
+CHAT_DOC_EXTS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "pages", "numbers"}
+MAX_CHAT_DOC_B64 = int(os.environ.get("PEERS_MAX_DOC_B64", str(34 * 1024 * 1024)))   # ≈25MB decoded
+
+@app.post("/v1/upload_chat_doc/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def upload_chat_doc(params: RequestUploadChatDoc, db: Session = Depends(get_db)):
+    try:
+        ext = params.doc_ext.lower().lstrip(".")
+        if ext not in CHAT_DOC_EXTS:
+            return JSONResponse(content={"success": False, "error": "Unsupported document type"}, status_code=400)
+        if len(params.doc_data) > MAX_CHAT_DOC_B64:
+            return JSONResponse(content={"success": False, "error": "Document too large"}, status_code=413)
+        media_id = uuid.uuid4().hex
+        with open(os.path.join(CHAT_MEDIA_DIR, f"{media_id}.{ext}"), "wb") as f:
+            f.write(base64.b64decode(params.doc_data))
+        return {"success": True, "media_id": media_id, "error": ""}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+@app.post("/v1/get_chat_doc/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def get_chat_doc(params: RequestGetChatDoc, db: Session = Depends(get_db)):
+    try:
+        mid = params.media_id
+        if not _is_hex32(mid):
+            return JSONResponse(content={"success": False, "error": "Invalid media id"}, status_code=400)
+        for ext in CHAT_DOC_EXTS:                      # ext isn't in the frame — probe the whitelist
+            path = os.path.join(CHAT_MEDIA_DIR, f"{mid}.{ext}")
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    return {"success": True, "doc_data": base64.b64encode(f.read()).decode("ascii"),
+                            "doc_ext": ext, "error": ""}
+        return JSONResponse(content={"success": False, "error": "Not found"}, status_code=404)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
+
+# Same auth note as delete_chat_video: X-API-Key only — the 32-char random media id is the deletion
+# secret, and this must keep working while the caller's account is being deleted.
+@app.post("/v1/delete_chat_doc/", dependencies=[Depends(verify_api_key)])
+async def delete_chat_doc(params: RequestDeleteChatDoc, db: Session = Depends(get_db)):
+    try:
+        mid = params.media_id
+        if not _is_hex32(mid):
+            return JSONResponse(content={"success": False, "error": "Invalid media id"}, status_code=400)
+        for ext in CHAT_DOC_EXTS:
+            path = os.path.join(CHAT_MEDIA_DIR, f"{mid}.{ext}")
+            if os.path.exists(path):
+                os.remove(path)
+        return {"success": True, "error": ""}
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
 

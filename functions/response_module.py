@@ -737,7 +737,8 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
     return data, android_config, apns_config
 
 
-def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str, text: str, badge: int, msg_id: str = "") -> bool:
+def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str, text: str, badge: int,
+                           msg_id: str = "", video_id: str = "", kind_label: str = "") -> bool:
     """Visible 'new message' push for a FRIEND's chat message to an offline/backgrounded peer:
       • aps.alert (title = sender name, body = the message text) → a real banner on the lock screen
         / a notification while the receiver is in another app,
@@ -755,9 +756,9 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
     if not target_token:
         return False
     name = sender_name or "A peer"
-    body = text or "New message"
+    body = text or kind_label or "New message"
     data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
-            "text": text or "", "msg_id": msg_id or ""}
+            "text": text or "", "msg_id": msg_id or "", "video_id": video_id or ""}
     aps_object = messaging.Aps(
         alert=messaging.ApsAlert(title=name, body=body),
         sound="default",
