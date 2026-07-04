@@ -688,10 +688,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     # by whichever device reconnects first — this per-device queue is theirs alone.
                     manager.enqueue_echo(target_id, data)
 
-                # A self-targeted CARD_RESOLVED (Join/Accept/Reject tapped on ONE of the user's devices)
-                # already fanned out live to their other ONLINE devices (send_all above, origin excluded);
-                # queue it for the OFFLINE siblings so their pending card resolves on relaunch too.
-                if target_id == client_id and msg_type == "CARD_RESOLVED":
+                # A self-targeted device-sync frame (a card resolved / a friend unfriended on ONE of the
+                # user's devices) already fanned out live to their other ONLINE devices (send_all above,
+                # origin excluded); queue it for the OFFLINE siblings so they catch up on relaunch too.
+                if target_id == client_id and msg_type in ("CARD_RESOLVED", "UNFRIEND_SYNC"):
                     manager.enqueue_echo(client_id, data, exclude_device=device)
 
                 # Push when the user's PHONE didn't get a live copy (a Mac-only delivery must not
