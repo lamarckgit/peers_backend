@@ -25,3 +25,4 @@ serviceAccountKey*.json
 constants.json.enc
 .env
 .env.*
+AuthKey*.p8
