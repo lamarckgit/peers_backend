@@ -2556,20 +2556,6 @@ async def update_user(params: RequestSetUser, username: response_module.Response
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-# @app.post("/v1/activate_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
-# async def activate_user(params: RequestActivateUser, username: response_module.ResponseUsername = Depends(check_credentials), db: Session = Depends(get_db)):
-#     try:
-#         if username: #if creditential valid => email
-#             if response_module.check_is_super_admin(db, username.email):
-#                 response = response_module.activate_user(db, params.id, params.is_active)
-#                 response_module.log_online_action(db, "", params.uuid, 13 if params.is_active else 14, True, "", params.id, "")
-#                 return response
-#
-#         raise Exception(f"Exception error: Unauthorized")
-#
-#     except Exception as e:
-#         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
 @app.post("/v1/add_user/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key)])
 async def add_user(params: RequestAddUser, username: response_module.ResponseUsername = Depends(check_credentials), db: Session = Depends(get_db)):
     try:
