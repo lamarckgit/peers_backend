@@ -26,3 +26,4 @@ constants.json.enc
 .env
 .env.*
 AuthKey*.p8
+_known_devices.json
