@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import asyncio
 import json
 import os
 import ssl
@@ -65,6 +66,12 @@ os.makedirs(CHAT_MEDIA_DIR, exist_ok=True)
 # in-process so a customer deployment is self-contained (no external cron/timer).
 SNAPSHOT_RETENTION_DAYS = int(os.environ.get("SNAPSHOT_RETENTION_DAYS", "14"))
 SNAPSHOT_CLEANUP_INTERVAL_S = int(os.environ.get("SNAPSHOT_CLEANUP_INTERVAL_S", str(24 * 3600)))
+# TTL backstop for chat media (videos/documents/posters): sender-delete/clear removes files right away,
+# but a receiver who never deletes would otherwise keep them forever. The upload time IS the file's
+# mtime (written once, never modified), so no filename change is needed and the TTL applies to files
+# already on disk. Must stay ABOVE PEERS_ECHO_MAX_AGE_DAYS so no still-queued frame references a
+# deleted file.
+CHAT_MEDIA_RETENTION_DAYS = int(os.environ.get("CHAT_MEDIA_RETENTION_DAYS", "30"))
 
 # 2. Background thread runners
 def run_license_manager():
@@ -90,13 +97,51 @@ def cleanup_snapshots_once():
     if removed:
         logging.info(f"Snapshot cleanup: removed {removed} files older than {SNAPSHOT_RETENTION_DAYS}d")
 
+def cleanup_chat_media_once():
+    """Delete chat media files older than CHAT_MEDIA_RETENTION_DAYS (mtime = upload time). A fetch of
+    an expired id returns the endpoint's normal "Not found" — the app shows its load-failure toast."""
+    cutoff = time.time() - CHAT_MEDIA_RETENTION_DAYS * 86400
+    removed = 0
+    try:
+        with os.scandir(CHAT_MEDIA_DIR) as entries:
+            for entry in entries:
+                if not entry.is_file():
+                    continue
+                try:
+                    if entry.stat().st_mtime < cutoff:
+                        os.remove(entry.path)
+                        removed += 1
+                except OSError:
+                    continue  # file vanished or unreadable; skip
+    except FileNotFoundError:
+        return
+    if removed:
+        logging.info(f"Chat-media cleanup: removed {removed} file(s) older than {CHAT_MEDIA_RETENTION_DAYS}d")
+
 def run_snapshot_cleanup():
     while True:
         try:
             cleanup_snapshots_once()
         except Exception as e:
             logging.error(f"Snapshot cleanup error: {e}")
+        try:
+            cleanup_chat_media_once()
+        except Exception as e:
+            logging.error(f"Chat-media cleanup error: {e}")
         time.sleep(SNAPSHOT_CLEANUP_INTERVAL_S)
+
+async def run_echo_cache_purge():
+    """Daily message-cache sweep — an asyncio task (NOT a thread: the queues belong to the event
+    loop), same cadence as the snapshot cleanup / license renewal."""
+    while True:
+        await asyncio.sleep(ECHO_PURGE_INTERVAL_S)
+        try:
+            dropped, forgotten, removed = manager.purge_expired_echo()
+            if dropped or forgotten or removed:
+                logging.info(f"Echo-cache cleanup: {dropped} expired frame(s), "
+                             f"{forgotten} stale device(s), {removed} orphan file(s)")
+        except Exception as e:
+            logging.error(f"Echo-cache cleanup error: {e}")
 
 # 3. Lifespan context
 @asynccontextmanager
@@ -110,7 +155,10 @@ async def lifespan(app: FastAPI):
         snapshot_cleanup_thread = threading.Thread(target=run_snapshot_cleanup, daemon=True)
         snapshot_cleanup_thread.start()
         logging.info("Started snapshot cleanup thread.")
+    echo_purge_task = asyncio.create_task(run_echo_cache_purge())
+    logging.info("Started daily echo-cache purge task.")
     yield
+    echo_purge_task.cancel()
     # Optionally add cleanup logic here if needed
     if hasattr(license_manager, "db") and license_manager.db is not None:
         license_manager.db.close()
@@ -181,6 +229,9 @@ MAX_ECHO_BYTES = int(os.environ.get("PEERS_MAX_ECHO_BYTES", str(64 * 1024 * 1024
 # so the cache is not downloadable. Keep it that way if a static mount is ever added.
 ECHO_CACHE_DIR = "static/message_cache"
 ECHO_CACHE_MAX_AGE = float(os.environ.get("PEERS_ECHO_MAX_AGE_DAYS", "14")) * 86400
+# Daily in-process sweep of the message cache (frames whose device never returned, stale devices,
+# orphaned files) — the startup purge alone never runs on a long-lived server.
+ECHO_PURGE_INTERVAL_S = int(os.environ.get("PEERS_ECHO_PURGE_INTERVAL_S", str(24 * 3600)))
 
 # Store active connections: bell_id -> WebSocket
 class ConnectionManager:
@@ -449,6 +500,72 @@ class ConnectionManager:
         if loaded or dropped:
             print(f"echo cache: restored {loaded} frame(s), dropped {dropped}")
 
+    def purge_expired_echo(self):
+        """Daily sweep (must run ON the event loop — the queues are mutated by the WS handlers):
+        1) drop queued frames older than ECHO_CACHE_MAX_AGE (their device is presumed gone for good);
+        2) forget known devices unseen for that long (with their queued files);
+        3) delete orphaned cache files no queue references (eviction/crash leftovers, >1 day old).
+        Returns (expired_frames, forgotten_devices, orphan_files)."""
+        now = time.time()
+
+        def frame_ts(path):
+            try:
+                return int(os.path.basename(path).split("-", 1)[0]) / 1000
+            except (ValueError, IndexError):
+                return None
+
+        dropped = 0
+        for uid, devs in list(self.echo_queue.items()):
+            for dev, dq in list(devs.items()):
+                # Filenames are ms-ordered per queue (FIFO), so expiry is a prefix; an entry without a
+                # parseable timestamp (in-memory only) stops the scan — it can't be older than a restart.
+                while dq:
+                    _, size, path = dq[0]
+                    ts = frame_ts(path) if path else None
+                    if ts is None or now - ts <= ECHO_CACHE_MAX_AGE:
+                        break
+                    dq.popleft()
+                    self._echo_bytes -= size
+                    self._delete_frame(path)
+                    dropped += 1
+                if not dq:
+                    devs.pop(dev, None)
+            if not devs:
+                self.echo_queue.pop(uid, None)
+
+        forgotten = 0
+        for uid, devs in list(self.known_devices.items()):
+            for dev, meta in list(devs.items()):
+                if dev in (self.active_connections.get(uid) or {}):
+                    continue
+                if now - (meta.get("seen") or 0) > ECHO_CACHE_MAX_AGE:
+                    devs.pop(dev, None)
+                    for _, s0, p0 in ((self.echo_queue.get(uid) or {}).pop(dev, None) or []):
+                        self._echo_bytes -= s0
+                        self._delete_frame(p0)
+                    forgotten += 1
+            if not devs:
+                self.known_devices.pop(uid, None)
+        if forgotten:
+            self._persist_devices()
+
+        removed = 0
+        try:
+            referenced = {e[2] for devs in self.echo_queue.values() for dq in devs.values() for e in dq}
+            for name in os.listdir(ECHO_CACHE_DIR):
+                if name.startswith("_") or not name.endswith(".json"):
+                    continue
+                path = os.path.join(ECHO_CACHE_DIR, name)
+                if path in referenced:
+                    continue
+                ts = frame_ts(name)
+                if ts is None or now - ts > 86400:   # unreferenced for over a day → leftover
+                    self._delete_frame(path)
+                    removed += 1
+        except OSError:
+            pass
+        return dropped, forgotten, removed
+
     def enqueue(self, target_id: str, data: dict):
         self._op_seq += 1
         seq = self._op_seq
@@ -598,6 +715,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         while True:
             # Receive JSON data (Offer, Answer, or Candidate)
             data = await websocket.receive_json()
+
+            # macOS window state: a DOCKED/hidden Mac keeps its socket (it must still receive chats
+            # and calls — there is no push on macOS) but stops counting as app-open for presence
+            # (the blue LED). Absent flag = visible, so iPhones/older Macs are unaffected.
+            if data.get("type") == "WINDOW_STATE":
+                meta = manager.device_meta.get(client_id, {}).get(device)
+                if meta is not None:
+                    meta["visible"] = bool(data.get("visible", True))
+                continue
 
             # Group chat messages have no single target — the relay fans them out to all members.
             if data.get("type") in ("GROUP_MESSAGE", "GROUP_EDIT", "GROUP_DELETE"):
@@ -1474,7 +1600,13 @@ async def register_peer_voip_token(params: RequestStoreVoipToken, db: Session = 
 # everyone else's nearby list.
 @app.post("/v1/peers_online/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)):
-    connected = [uid for uid in params.uuids if uid in manager.active_connections]
+    # A device counts as PRESENT only while its window is visible (a docked/hidden Mac reports
+    # WINDOW_STATE visible=false; devices that never report — iPhones, older Macs — default visible).
+    def _present(uid):
+        metas = manager.device_meta.get(uid, {})
+        return any(metas.get(dev, {}).get("visible", True)
+                   for dev in (manager.active_connections.get(uid) or {}))
+    connected = [uid for uid in params.uuids if uid in manager.active_connections and _present(uid)]
     # Single query → is_active for every queried peer. `online` = connected AND active; `inactive` =
     # is_active=0 (reported separately so the app keeps a backgrounded-but-active peer that's still nearby
     # while dropping a genuinely-inactive one even in BLE range).
@@ -1499,7 +1631,8 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     # `connected` = raw live-socket presence, hidden (is_active=0) peers INCLUDED — the Friends-list
     # BLUE "app open" LED reads this (hiding only affects discovery/green, not app-open status).
     return {"online": online, "inactive": inactive, "blocked": blocked, "closed": closed,
-            "connected": [u for u in connected if u not in blocked and u not in hidden_live]}
+            "connected": [u for u in connected if u not in blocked and u not in hidden_live],
+            "hiddenLive": list(hidden_live)}
 
 # Permanently blocks a peer for this user: marks (or creates) their user_user link is_active = 0, so
 # the combination disappears from nearby + friends and can no longer wake either side. X-API-Key only.
