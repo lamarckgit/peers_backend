@@ -33,7 +33,7 @@ from typing import Dict, List, Optional
 
 # 1. Create global instances
 license_manager = LicenseManager()
-license_manager.ensure_constants()    # Make sure constants are loaded!
+license_manager.ensure_constants()     # Make sure constants are loaded!
 # Each customer instance has its OWN database (DATABASE_URL comes from the
 # license-issued constants and may point at its own MariaDB host). A modest
 # per-instance pool is a sane default for a single-worker app; bump it per
