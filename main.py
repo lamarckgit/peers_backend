@@ -691,7 +691,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # A self-targeted device-sync frame (a card resolved / a friend unfriended on ONE of the
                 # user's devices) already fanned out live to their other ONLINE devices (send_all above,
                 # origin excluded); queue it for the OFFLINE siblings so they catch up on relaunch too.
-                if target_id == client_id and msg_type in ("CARD_RESOLVED", "UNFRIEND_SYNC"):
+                if target_id == client_id and msg_type in ("CARD_RESOLVED", "UNFRIEND_SYNC", "SETTING_SYNC"):
                     manager.enqueue_echo(client_id, data, exclude_device=device)
 
                 # Push when the user's PHONE didn't get a live copy (a Mac-only delivery must not
@@ -941,6 +941,10 @@ class RequestPeersOnline(BaseModel):
 class RequestUpdateOpenToFriends(BaseModel):
     uuid: str              # the authenticated peer (check_peer_uuid)
     is_open_for_new: bool  # True → open to making new friends (discoverable); False → hidden from new peers
+
+class RequestUpdateHideLive(BaseModel):
+    uuid: str              # the authenticated peer (check_peer_uuid)
+    hide_live: bool        # True → omit from peers_online `connected` (no blue "app open" LED)
 
 class RequestAddFriend(BaseModel):
     uuid: str
@@ -1486,7 +1490,16 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     # `blocked`) so the app hides them from Nearby UNLESS they're already friends. Does NOT affect `online`
     # (a closed peer who is a friend still shows online, e.g. for the friend LED).
     closed = list(response_module.closed_peer_set(db, params.uuids))
-    return {"online": online, "inactive": inactive, "blocked": blocked, "closed": closed}
+    # Peers hiding their live status (user.hide_live = 1) — dropped from `connected` below so friends
+    # never see their blue "app open" LED. Graceful before the ALTER TABLE (error → nobody hidden).
+    try:
+        hidden_live = response_module.hide_live_set(db, params.uuids)
+    except Exception:
+        hidden_live = set()
+    # `connected` = raw live-socket presence, hidden (is_active=0) peers INCLUDED — the Friends-list
+    # BLUE "app open" LED reads this (hiding only affects discovery/green, not app-open status).
+    return {"online": online, "inactive": inactive, "blocked": blocked, "closed": closed,
+            "connected": [u for u in connected if u not in blocked and u not in hidden_live]}
 
 # Permanently blocks a peer for this user: marks (or creates) their user_user link is_active = 0, so
 # the combination disappears from nearby + friends and can no longer wake either side. X-API-Key only.
@@ -1695,6 +1708,17 @@ async def activate_user(params: RequestActivateUser, db: Session = Depends(get_d
 
 # Sets the user's "open to making new friends" flag (is_open_for_new). When 0, other peers hide this user
 # from their Nearby list unless they're already friends. X-API-Key only.
+# Sets a peer's hide_live flag ("Hide my live status"): when 1, peers_online omits this user from the
+# `connected` list, so friends never see the blue "app open" LED (read receipts are withheld app-side).
+@app.post("/v1/update_hide_live/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def update_hide_live(params: RequestUpdateHideLive, db: Session = Depends(get_db)):
+    try:
+        return response_module.update_hide_live(db, params.uuid, params.hide_live)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 @app.post("/v1/update_open_to_friends/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def update_open_to_friends(params: RequestUpdateOpenToFriends, db: Session = Depends(get_db)):
     try:

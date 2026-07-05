@@ -1434,6 +1434,60 @@ def closed_peer_set(db: Session, peer_hexes):
             closed.add(by_uuid[key])
     return closed
 
+def hide_live_set(db: Session, peer_hexes):
+    """Returns the subset of peer_hexes that HIDE their live status (user.hide_live = 1): peers_online
+    drops them from `connected`, so friends never see the blue "app open" LED for them. ONE round-trip,
+    mirroring closed_peer_set. Missing column raises (caller treats as nobody hidden); NULL/0 → visible,
+    so pre-existing users can't accidentally hide."""
+    by_uuid = {}
+    for peer_hex in peer_hexes:
+        try:
+            b = bytes.fromhex(peer_hex)
+        except (ValueError, TypeError):
+            continue
+        if len(b) == 16:
+            by_uuid[b] = peer_hex
+    if not by_uuid:
+        return set()
+    keys = list(by_uuid.keys())
+    placeholders = ", ".join(f":u{i}" for i in range(len(keys)))
+    bind = {f"u{i}": k for i, k in enumerate(keys)}
+    rows = db.execute(
+        text(f"SELECT uuid, hide_live FROM user WHERE uuid IN ({placeholders})"),
+        bind,
+    ).mappings().all()
+    hidden = set()
+    for row in rows:
+        key = bytes(row["uuid"])
+        val = row["hide_live"]
+        if key in by_uuid and val is not None and bool(val):
+            hidden.add(by_uuid[key])
+    return hidden
+
+def update_hide_live(db: Session, user_hex: str, hide: bool):
+    """Sets a peer's hide_live flag ("Hide my live status" in Settings). X-API-Key only."""
+    try:
+        try:
+            user_uuid = bytes.fromhex(user_hex)
+        except ValueError:
+            raise Exception("Invalid uuid")
+        if len(user_uuid) != 16:
+            raise Exception("Invalid uuid")
+
+        result = db.execute(
+            text("UPDATE user SET hide_live = :hide WHERE uuid = :uuid"),
+            {"hide": 1 if hide else 0, "uuid": user_uuid},
+        )
+        db.commit()
+        if result.rowcount == 0:
+            raise Exception("Peer not found")
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
 def update_open_to_friends(db: Session, user_hex: str, is_open: bool):
     """Sets a peer's is_open_for_new flag (open to making new friends = discoverable by nearby non-friends).
     X-API-Key only. Mirrors activate_user; does NOT filter on any flag so it always applies."""
