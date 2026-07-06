@@ -190,6 +190,27 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s",
                     handlers=[log_handler])
 
+# Timestamp every line that lands in the stdout/stderr log (logs/uvicorn.log) as hh:mm:ss.ddd —
+# matching the app-side log format so client and server logs line up during debugging.
+# Two sources feed that file and neither goes through the root logger above:
+#  1) uvicorn's own loggers (access/error) — prepend the time to their EXISTING formatters, keeping
+#     uvicorn's format (level prefix, "200 OK" status phrase) intact. uvicorn configures these before
+#     importing this module, so the handlers exist by now.
+for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for _uv_handler in logging.getLogger(_uv_name).handlers:
+        _old = _uv_handler.formatter
+        if _old is not None and "%(asctime)s" not in (_old._fmt or ""):
+            _uv_handler.setFormatter(type(_old)(
+                "%(asctime)s.%(msecs)03d " + _old._fmt, datefmt="%H:%M:%S"))
+
+#  2) the relay's plain print() lines — wrap the builtin so each line gets the same stamp.
+import builtins as _builtins
+from datetime import datetime as _dt
+_plain_print = _builtins.print
+def _stamped_print(*args, **kwargs):
+    _plain_print(_dt.now().strftime("%H:%M:%S.%f")[:-3], *args, **kwargs)
+_builtins.print = _stamped_print
+
 class LogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         #print("🔹 Incoming request headers:", request.headers)
