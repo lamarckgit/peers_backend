@@ -880,8 +880,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         except Exception as e:
                             print(f"relay chat-msg push error: {e}")
                     # Signal types that warrant a push when the target is offline
-                    # (backgrounded/killed): chat request, call request + the friend handshake.
-                    elif msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND", "GROUP_INVITE"):
+                    # (backgrounded/killed): chat request, call request/cancel + the friend handshake.
+                    # CALL_CANCEL matters because the ring itself may have been push-delivered: without
+                    # a cancel push the backgrounded receiver keeps ringing until its own timeout.
+                    elif msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "CALL_CANCEL", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND", "GROUP_INVITE"):
                         try:
                             s = database.create_session()
                             try:
@@ -892,7 +894,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # accept, so the sender just times out; the only window a just-killed peer
                                 # still sees a banner is the brief presence latency before it leaves the
                                 # nearby list. FRIEND_* is always allowed.
-                                if msg_type == "CALL_REQUEST" and not response_module.are_friends(s, client_id, target_id):
+                                if msg_type in ("CALL_REQUEST", "CALL_CANCEL") and not response_module.are_friends(s, client_id, target_id):
                                     print(f"relay: {msg_type} to offline {target_id[:8]} suppressed (sender not a friend)")
                                 else:
                                     fcm_token, _, voip_token = response_module.get_peer_push_info(s, target_id)
@@ -944,7 +946,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 s.close()
                         except Exception as e:
                             print(f"relay group-call push error: {e}")
-                    elif msg_type in ("CHAT_EDIT", "CHAT_DELETE", "CHAT_READ", "CHAT_CLEAR"):
+                    elif msg_type in ("CHAT_EDIT", "CHAT_DELETE", "CHAT_READ", "CHAT_CLEAR", "CHAT_REACTION"):
                         # Hold the edit/delete/read-receipt and deliver it when the (killed/offline) target
                         # returns, so the Sender's edit/delete still applies — and a CHAT_READ (receiver
                         # opened the chat) reaches the offline sender so their check turns green on reconnect.

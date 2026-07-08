@@ -705,6 +705,7 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
     copy = {
         "CHAT_REQUEST":   ("Incoming chat",     f"{name} wants to chat"),
         "CALL_REQUEST":   ("Incoming call",     f"{name} is calling"),
+        "CALL_CANCEL":    ("Missed call",       f"You missed a call from {name}"),
         "FRIEND_REQUEST": ("Friend Request",    f"{name} wants to be friends"),
         "FRIEND_ACCEPT":  ("New friend",        f"You're friends now with {name}"),
         "NOFRIEND":       ("Friend request",    f"{name} declined your friend request"),
@@ -729,7 +730,10 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
         # lock screen, and breaks through Focus/Do Not Disturb — matching the in-app local notification.
         custom_data={"interruption-level": "time-sensitive"},
     )
-    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    # ttl=60 (not 0): "now or never" made FCM silently DROP the push whenever the phone was in a
+    # Doze window even though send() returned True — a backgrounded receiver then never rang. 60s
+    # comfortably covers the 45s ring window while still expiring stale signals.
+    android_config = messaging.AndroidConfig(priority="high", ttl=60)
     apns_config = messaging.APNSConfig(
         headers={"apns-priority": "10", "apns-push-type": "alert"},
         payload=messaging.APNSPayload(aps=aps_object),
@@ -765,7 +769,7 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
         badge=badge,
         content_available=True,
     )
-    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    android_config = messaging.AndroidConfig(priority="high", ttl=3600)   # survive short Doze/offline windows (was ttl=0)
     apns_config = messaging.APNSConfig(
         headers={"apns-priority": "10", "apns-push-type": "alert"},
         payload=messaging.APNSPayload(aps=aps_object),
@@ -802,7 +806,7 @@ def send_group_message_push(target_token: str, sender_hex: str, sender_name: str
         content_available=True,
         custom_data={"interruption-level": "time-sensitive"},
     )
-    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    android_config = messaging.AndroidConfig(priority="high", ttl=3600)   # survive short Doze/offline windows (was ttl=0)
     apns_config = messaging.APNSConfig(
         headers={"apns-priority": "10", "apns-push-type": "alert"},
         payload=messaging.APNSPayload(aps=aps_object),
@@ -839,7 +843,7 @@ def send_group_call_push(target_token: str, sender_hex: str, sender_name: str, g
         content_available=True,
         custom_data={"interruption-level": "time-sensitive"},
     )
-    android_config = messaging.AndroidConfig(priority="high", ttl=0)
+    android_config = messaging.AndroidConfig(priority="high", ttl=60)   # covers the ring window; was ttl=0 (dropped in Doze)
     apns_config = messaging.APNSConfig(
         headers={"apns-priority": "10", "apns-push-type": "alert"},
         payload=messaging.APNSPayload(aps=aps_object),
