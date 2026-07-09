@@ -1185,7 +1185,7 @@ def delete_peer(db: Session, peer_hex: str):
         # orphan rows). Order: memberships of groups THEY admin, their admin'd groups, their own
         # memberships, friend links (either direction), then the user row.
         db.execute(
-            text("DELETE ug FROM user_group ug JOIN `group` g ON g.id = ug.group_id WHERE g.admin_admin_uuid = :uuid"),
+            text("DELETE ug FROM user_group ug JOIN `group` g ON g.id = ug.group_id WHERE g.admin_user_uuid = :uuid"),
             {"uuid": peer_uuid},
         )
         db.execute(
