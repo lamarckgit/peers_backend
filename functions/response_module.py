@@ -1180,7 +1180,22 @@ def delete_peer(db: Session, peer_hex: str):
         if len(peer_uuid) != 16:
             raise Exception("Invalid peer uuid")
 
-        # Remove friend links first (either direction), then the user row.
+        # Remove everything referencing the user before the user row itself (the Groups tables
+        # arrived after this function was first written — leaving them made the delete fail /
+        # orphan rows). Order: memberships of groups THEY admin, their admin'd groups, their own
+        # memberships, friend links (either direction), then the user row.
+        db.execute(
+            text("DELETE ug FROM user_group ug JOIN `group` g ON g.id = ug.group_id WHERE g.admin = :uuid"),
+            {"uuid": peer_uuid},
+        )
+        db.execute(
+            text("DELETE FROM `group` WHERE admin_user_uuid = :uuid"),
+            {"uuid": peer_uuid},
+        )
+        db.execute(
+            text("DELETE FROM user_group WHERE user_uuid = :uuid"),
+            {"uuid": peer_uuid},
+        )
         db.execute(
             text("DELETE FROM user_user WHERE uuid_1 = :uuid OR uuid_2 = :uuid"),
             {"uuid": peer_uuid},
