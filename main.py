@@ -1595,6 +1595,23 @@ async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# A peer just became DISCOVERABLE (fresh advertising session): silently nudge its FRIENDS' apps
+# to restart their BLE scans — a locked iPhone's duplicate-filtered background scan would otherwise
+# only rediscover the peer at the next address rotation (up to ~15 min). Friends only (bounded and
+# private), silent (no banner), best-effort.
+@app.post("/v1/nearby_wake/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def nearby_wake(params: RequestUuid, db: Session = Depends(get_db)):
+    try:
+        sent = 0
+        for f in response_module.get_friends(db, params.uuid):
+            fcm_token, _, _ = response_module.get_peer_push_info(db, f["uuid"])
+            if fcm_token and response_module.send_silent_wake(fcm_token):
+                sent += 1
+        print(f"nearby_wake: {params.uuid[:8]} kicked {sent} friend(s)")
+        return response_module.ResponseResult(success=True, error="")
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # iOS re-pings PEER_NEARBY over REST while its relay socket is suspended in the background (a BLE
 # wake-up is long enough for one HTTP POST, not for a socket resume). Injects the exact frame the
 # WS relay would route, so the receiver's signalled-nearby bootstrap stays fresh; an offline target

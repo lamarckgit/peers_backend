@@ -741,6 +741,31 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
     return data, android_config, apns_config
 
 
+def send_silent_wake(target_token: str) -> bool:
+    """Data-only 'NEARBY_WAKE': nudges a backgrounded/locked app to restart its BLE scan so a
+    freshly-discoverable nearby peer is found in seconds instead of at the next address rotation
+    (up to ~15 min for a locked iPhone's duplicate-filtered background scan). Silent on iOS
+    (content-available, no alert — subject to Apple's silent-push budget), a plain data message on
+    Android. False on not-configured / empty token / error."""
+    if app_peers is None or not target_token:
+        return False
+    try:
+        message = messaging.Message(
+            token=target_token,
+            data={"action": "NEARBY_WAKE"},
+            android=messaging.AndroidConfig(priority="high", ttl=60),
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "5", "apns-push-type": "background"},
+                payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True)),
+            ),
+        )
+        messaging.send(message, app=app_peers)
+        return True
+    except Exception as e:
+        print(f"send_silent_wake error [{type(e).__name__}]: {e}")
+        return False
+
+
 def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str, text: str, badge: int,
                            msg_id: str = "", video_id: str = "", kind_label: str = "") -> bool:
     """Visible 'new message' push for a FRIEND's chat message to an offline/backgrounded peer:
