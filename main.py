@@ -765,6 +765,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 msg_type = data.get("type")
                 print(f"relay {client_id} → {target_id}: {msg_type}")
 
+                # Physical-proximity memory for nearby_wake (see record_proximity).
+                if msg_type == "PEER_NEARBY":
+                    record_proximity(client_id, target_id)
+
                 # Block gate: a blocked combination (user_user.is_active = 0, either direction) can neither
                 # chat nor call. Drop it and bounce a generic "communication failure" back to the SENDER
                 # (generic on purpose — it does not reveal that they've been blocked).
@@ -1595,6 +1599,23 @@ async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# Recent physical proximity (uuid → {other_uuid: last_seen_ts}), fed by PEER_NEARBY over both the
+# WS relay and the REST endpoint. Powers nearby_wake for NON-friends who have met before: two
+# strangers that pinged each other recently can be silently re-woken for each other, even though
+# no friendship (= push permission) exists yet. In-memory, best-effort, symmetric.
+recent_proximity: dict = {}
+PROXIMITY_TTL = 6 * 3600.0
+
+def record_proximity(a: str, b: str):
+    now = time.time()
+    for x, y in ((a, b), (b, a)):
+        d = recent_proximity.setdefault(x, {})
+        d[y] = now
+        # Opportunistic pruning keeps the map small without a scheduler.
+        if len(d) > 64:
+            for k in [k for k, ts in d.items() if now - ts > PROXIMITY_TTL]:
+                d.pop(k, None)
+
 # A peer just became DISCOVERABLE (fresh advertising session): silently nudge its FRIENDS' apps
 # to restart their BLE scans — a locked iPhone's duplicate-filtered background scan would otherwise
 # only rediscover the peer at the next address rotation (up to ~15 min). Friends only (bounded and
@@ -1602,12 +1623,18 @@ async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
 @app.post("/v1/nearby_wake/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def nearby_wake(params: RequestUuid, db: Session = Depends(get_db)):
     try:
+        now = time.time()
+        targets = {f["uuid"] for f in response_module.get_friends(db, params.uuid)}
+        # Plus recently-nearby NON-friends (they pinged each other within the TTL — a re-encounter
+        # of two locked phones would otherwise wait for a BLE address rotation, up to ~15 min).
+        targets |= {u for u, ts in recent_proximity.get(params.uuid, {}).items() if now - ts < PROXIMITY_TTL}
+        targets.discard(params.uuid)
         sent = 0
-        for f in response_module.get_friends(db, params.uuid):
-            fcm_token, _, _ = response_module.get_peer_push_info(db, f["uuid"])
+        for target in list(targets)[:32]:   # bounded fan-out
+            fcm_token, _, _ = response_module.get_peer_push_info(db, target)
             if fcm_token and response_module.send_silent_wake(fcm_token):
                 sent += 1
-        print(f"nearby_wake: {params.uuid[:8]} kicked {sent} friend(s)")
+        print(f"nearby_wake: {params.uuid[:8]} kicked {sent} peer(s)")
         return response_module.ResponseResult(success=True, error="")
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -1619,6 +1646,7 @@ async def nearby_wake(params: RequestUuid, db: Session = Depends(get_db)):
 @app.post("/v1/peer_nearby/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def peer_nearby(params: RequestAddFriend):
     try:
+        record_proximity(params.uuid, params.friend_uuid)
         await manager.send_all(params.friend_uuid,
                                {"type": "PEER_NEARBY", "sender": params.uuid, "target": params.friend_uuid})
         return response_module.ResponseResult(success=True, error="")
