@@ -1595,6 +1595,19 @@ async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# iOS re-pings PEER_NEARBY over REST while its relay socket is suspended in the background (a BLE
+# wake-up is long enough for one HTTP POST, not for a socket resume). Injects the exact frame the
+# WS relay would route, so the receiver's signalled-nearby bootstrap stays fresh; an offline target
+# is simply dropped (nearby-ness is ephemeral — never queued, never pushed).
+@app.post("/v1/peer_nearby/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def peer_nearby(params: RequestAddFriend):
+    try:
+        await manager.send_all(params.friend_uuid,
+                               {"type": "PEER_NEARBY", "sender": params.uuid, "target": params.friend_uuid})
+        return response_module.ResponseResult(success=True, error="")
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # Registers a peer's FCM push token (so it can be woken/rung for an incoming chat while its app
 # is backgrounded). X-API-Key only — peers have no OAuth session — keyed by uuid hex in the body
 # ({"uuid": ..., "fcm_token": ...}), reusing the iOS postRequestForJson helper like create_peer.
