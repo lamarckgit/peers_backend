@@ -1,4 +1,5 @@
 import base64
+import glob
 import hashlib
 import hmac
 import logging
@@ -688,17 +689,21 @@ async def relay_group_message(client_id: str, data: dict, msg_type: str, origin_
         s = database.create_session()
         try:
             members = response_module.group_member_hexes(s, group_id)
+            live_only = msg_type == "LOCATION_UPDATE"   # ephemeral positions: live sends only
             sender_name = data.get("senderName") or ""
-            if not sender_name:
+            if not sender_name and msg_type == "GROUP_MESSAGE":
                 _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
             for member_id in members:
                 if member_id == client_id:
                     # Self-echo: mirror the sender's own group message to their OTHER devices —
                     # live now, queued for an offline sibling's reconnect.
                     await manager.send_all(client_id, data, exclude_ws=origin_ws, echo_capable_only=True)
-                    manager.enqueue_echo(client_id, data, exclude_device=origin_device)
+                    if not live_only:
+                        manager.enqueue_echo(client_id, data, exclude_device=origin_device)
                     continue
                 delivered_any, delivered_phone = await manager.send_all(member_id, data)
+                if live_only:
+                    continue
                 # Per-device catch-up for the member's offline sibling devices (e.g. a killed Mac
                 # whose iPhone received the live copy). De-duped client-side by msgId.
                 manager.enqueue_echo(member_id, data)
@@ -749,6 +754,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             # Group chat messages have no single target — the relay fans them out to all members.
             # GROUP_CLEAR = the admin wiped the whole group history (members wipe their transcript).
             if data.get("type") in ("GROUP_MESSAGE", "GROUP_EDIT", "GROUP_DELETE", "GROUP_CLEAR"):
+                data["sender"] = client_id
+                await relay_group_message(client_id, data, data.get("type"), origin_ws=websocket,
+                                          origin_device=device)
+                continue
+
+            # Group live-location: positions/stops stamped with a groupId fan to the members too
+            # (updates are live-only — never queued or pushed; a stop is queued so an offline
+            # member still sees the share end on reconnect).
+            if data.get("type") in ("LOCATION_UPDATE", "LOCATION_STOP") and data.get("groupId"):
                 data["sender"] = client_id
                 await relay_group_message(client_id, data, data.get("type"), origin_ws=websocket,
                                           origin_device=device)
@@ -2352,7 +2366,6 @@ async def get_chat_video_cover(params: RequestGetChatVideo, db: Session = Depend
 
 # Any sanitized extension is accepted (the stored name is <uuid>.<ext>, so an alphanumeric ext
 # can't traverse); unknown/odd extensions are stored as .bin. Covers images, svg, zip, binaries.
-CHAT_DOC_EXTS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf","pages", "numbers", "key", "sql", "zip"}  # legacy list, no longer enforced
 MAX_CHAT_DOC_B64 = int(os.environ.get("PEERS_MAX_DOC_B64", str(34 * 1024 * 1024)))   # ≈25MB decoded
 
 @app.post("/v1/upload_chat_doc/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
@@ -2376,12 +2389,14 @@ async def get_chat_doc(params: RequestGetChatDoc, db: Session = Depends(get_db))
         mid = params.media_id
         if not _is_hex32(mid):
             return JSONResponse(content={"success": False, "error": "Invalid media id"}, status_code=400)
-        for ext in CHAT_DOC_EXTS:                      # ext isn't in the frame — probe the whitelist
-            path = os.path.join(CHAT_MEDIA_DIR, f"{mid}.{ext}")
-            if os.path.exists(path):
-                with open(path, "rb") as f:
-                    return {"success": True, "doc_data": base64.b64encode(f.read()).decode("ascii"),
-                            "doc_ext": ext, "error": ""}
+        # ext isn't in the frame — the (hex-validated) media id globs to exactly one stored file
+        matches = glob.glob(os.path.join(CHAT_MEDIA_DIR, f"{mid}.*"))
+        if matches:
+            path = matches[0]
+            ext = os.path.splitext(path)[1].lstrip(".")
+            with open(path, "rb") as f:
+                return {"success": True, "doc_data": base64.b64encode(f.read()).decode("ascii"),
+                        "doc_ext": ext, "error": ""}
         return JSONResponse(content={"success": False, "error": "Not found"}, status_code=404)
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
@@ -2394,10 +2409,8 @@ async def delete_chat_doc(params: RequestDeleteChatDoc, db: Session = Depends(ge
         mid = params.media_id
         if not _is_hex32(mid):
             return JSONResponse(content={"success": False, "error": "Invalid media id"}, status_code=400)
-        for ext in CHAT_DOC_EXTS:
-            path = os.path.join(CHAT_MEDIA_DIR, f"{mid}.{ext}")
-            if os.path.exists(path):
-                os.remove(path)
+        for path in glob.glob(os.path.join(CHAT_MEDIA_DIR, f"{mid}.*")):
+            os.remove(path)
         return {"success": True, "error": ""}
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
