@@ -2350,15 +2350,17 @@ async def get_chat_video_cover(params: RequestGetChatVideo, db: Session = Depend
 # uploaded once to static/chat_media/<media_id>.<ext>, referenced by docId in the chat message (with
 # docName/docSize riding the frame), so a killed/offline receiver can still fetch them later.
 
-CHAT_DOC_EXTS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf","pages", "numbers", "key", "sql", "zip"}
+# Any sanitized extension is accepted (the stored name is <uuid>.<ext>, so an alphanumeric ext
+# can't traverse); unknown/odd extensions are stored as .bin. Covers images, svg, zip, binaries.
+CHAT_DOC_EXTS = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf","pages", "numbers", "key", "sql", "zip"}  # legacy list, no longer enforced
 MAX_CHAT_DOC_B64 = int(os.environ.get("PEERS_MAX_DOC_B64", str(34 * 1024 * 1024)))   # ≈25MB decoded
 
 @app.post("/v1/upload_chat_doc/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def upload_chat_doc(params: RequestUploadChatDoc, db: Session = Depends(get_db)):
     try:
         ext = params.doc_ext.lower().lstrip(".")
-        if ext not in CHAT_DOC_EXTS:
-            return JSONResponse(content={"success": False, "error": "Unsupported document type"}, status_code=400)
+        if not ext or not ext.isalnum() or len(ext) > 8:
+            ext = "bin"
         if len(params.doc_data) > MAX_CHAT_DOC_B64:
             return JSONResponse(content={"success": False, "error": "Document too large"}, status_code=413)
         media_id = uuid.uuid4().hex
