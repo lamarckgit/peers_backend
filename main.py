@@ -438,6 +438,62 @@ class ConnectionManager:
 
     # ---- echo-queue disk persistence (ECHO_CACHE_DIR) ----
 
+    def drop_peer(self, client_id: str):
+        """A peer deleted their profile: purge EVERYTHING the relay caches for them — queued
+        echo/offline frames (their own devices' queues AND frames THEY sent still sitting in
+        other peers' queues), the message_cache files on disk (filenames embed sender and
+        receiver), known devices, pending control ops, live-location pins, and the badge
+        counter. Any live sockets just drop on their own."""
+        # Their own queued frames (+ files).
+        for q in (self.echo_queue.pop(client_id, None) or {}).values():
+            for _, s0, p0 in q:
+                self._echo_bytes -= s0
+                self._delete_frame(p0)
+        # Frames THEY sent, awaiting other peers' devices.
+        for devs in self.echo_queue.values():
+            for dev, q in list(devs.items()):
+                kept = deque()
+                for frame in q:
+                    if str(frame[0].get("sender") or "") == client_id:
+                        self._echo_bytes -= frame[1]
+                        self._delete_frame(frame[2])
+                    else:
+                        kept.append(frame)
+                devs[dev] = kept
+        self.known_devices.pop(client_id, None)
+        self.device_meta.pop(client_id, None)
+        self._persist_devices()
+        # Pending control ops queued FOR them (indexed) + sent BY them (scan; the reconnect
+        # flush pops seqs with a None guard, so the per-peer index needs no repair).
+        for seq in list(self.pending_by_peer.pop(client_id, ()) or ()):
+            entry = self.pending_ops.pop(seq, None)
+            if entry:
+                self._pending_bytes -= entry[2]
+        for seq, (target, data, size) in list(self.pending_ops.items()):
+            if str(data.get("sender") or "") == client_id:
+                self.pending_ops.pop(seq, None)
+                self._pending_bytes -= size
+        # Live-location pins cached FOR them + positions THEY were sharing with others.
+        gone = self.live_positions.pop(client_id, None)
+        if gone:
+            self._live_count -= len(gone)
+        for target, positions in list(self.live_positions.items()):
+            for mid in [m for m, d in positions.items() if str(d.get("sender") or "") == client_id]:
+                positions.pop(mid, None)
+                self._live_count -= 1
+            if not positions:
+                self.live_positions.pop(target, None)
+        self.pending_badge.pop(client_id, None)
+        # Disk sweep: any remaining message_cache file naming this peer as sender or receiver
+        # (uuids are fixed 32-hex between underscores, so the marker match is exact).
+        try:
+            marker = f"_{client_id}_"
+            for name in os.listdir(ECHO_CACHE_DIR):
+                if marker in name and name.endswith(".json"):
+                    self._delete_frame(os.path.join(ECHO_CACHE_DIR, name))
+        except Exception as e:
+            print(f"drop_peer cache sweep failed: {e}")
+
     def _persist_frame(self, receiver: str, device: str, data: dict) -> str:
         """Mirror a queued frame to <unix_ms>-<seq>_<sender>_<receiver>_<device>.json (written via a
         temp file + atomic rename so a crash can't leave a half-written frame). Best-effort: on a
@@ -1607,6 +1663,25 @@ async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
                         os.remove(os.path.join(ADDITIONAL_DIR, name))
                     except OSError as e:
                         print(f"delete_peer: failed to remove additional file {name}: {e}")
+        # Chat media (videos/docs) UPLOADED by this peer — files + their ownership records.
+        # (Only media uploaded since the ownership index exists can be identified.)
+        try:
+            owners = _load_media_owners()
+            mine = [m for m, o in owners.items() if o == params.uuid]
+            if mine:
+                for m in mine:
+                    if _is_hex32(m):
+                        for path in glob.glob(os.path.join(CHAT_MEDIA_DIR, f"{m}.*")):
+                            try:
+                                os.remove(path)
+                            except OSError as e:
+                                print(f"delete_peer: failed to remove chat media {path}: {e}")
+                    owners.pop(m, None)
+                _save_media_owners(owners)
+        except Exception as e:
+            print(f"delete_peer: chat media cleanup failed: {e}")
+        # Everything the relay queues/caches for or from this peer — incl. message_cache files.
+        manager.drop_peer(params.uuid)
         return result
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
@@ -2303,6 +2378,31 @@ async def get_additional_video(params: RequestGetAdditionalVideo, db: Session = 
 def _is_hex32(s: str) -> bool:
     return len(s) == 32 and all(c in "0123456789abcdef" for c in s)
 
+# Ownership index for chat media: {media_id: uploader_hex}. Files are named by a RANDOM media id,
+# so without this map a deleted peer's uploads couldn't be identified (delete_peer needs to). The
+# leading underscore keeps it clear of the get/delete endpoints' `<hex32>.*` globs.
+CHAT_MEDIA_OWNERS = os.path.join(CHAT_MEDIA_DIR, "_owners.json")
+
+def _load_media_owners() -> dict:
+    try:
+        with open(CHAT_MEDIA_OWNERS) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_media_owners(owners: dict):
+    with open(CHAT_MEDIA_OWNERS + ".tmp", "w") as f:
+        json.dump(owners, f, separators=(",", ":"))
+    os.replace(CHAT_MEDIA_OWNERS + ".tmp", CHAT_MEDIA_OWNERS)
+
+def _record_media_owner(media_id: str, owner_hex: str):
+    try:
+        owners = _load_media_owners()
+        owners[media_id] = owner_hex
+        _save_media_owners(owners)
+    except Exception as e:
+        print(f"chat media owner record failed: {e}")
+
 @app.post("/v1/upload_chat_video/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def upload_chat_video(params: RequestUploadChatVideo, db: Session = Depends(get_db)):
     try:
@@ -2313,6 +2413,7 @@ async def upload_chat_video(params: RequestUploadChatVideo, db: Session = Depend
         if params.cover_data:
             with open(os.path.join(CHAT_MEDIA_DIR, f"{media_id}.jpg"), "wb") as f:
                 f.write(base64.b64decode(params.cover_data))
+        _record_media_owner(media_id, params.uuid)
         return {"success": True, "media_id": media_id, "error": ""}
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
@@ -2379,6 +2480,7 @@ async def upload_chat_doc(params: RequestUploadChatDoc, db: Session = Depends(ge
         media_id = uuid.uuid4().hex
         with open(os.path.join(CHAT_MEDIA_DIR, f"{media_id}.{ext}"), "wb") as f:
             f.write(base64.b64decode(params.doc_data))
+        _record_media_owner(media_id, params.uuid)
         return {"success": True, "media_id": media_id, "error": ""}
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=500)
