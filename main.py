@@ -839,9 +839,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 if msg_type == "PEER_NEARBY":
                     record_proximity(client_id, target_id)
 
-                # Block gate: a blocked combination (user_user.is_active = 0, either direction) can neither
-                # chat nor call. Drop it and bounce a generic "communication failure" back to the SENDER
-                # (generic on purpose — it does not reveal that they've been blocked).
+                # Block gate: a live-blocked combination (user_user.is_active = 0, either direction,
+                # block_ts not yet expired) can neither chat nor call. Drop it and bounce a generic
+                # "communication failure" back to the SENDER (generic on purpose — it does not reveal
+                # that they've been blocked).
                 if msg_type in ("CHAT_MESSAGE", "CHAT_REQUEST", "CALL_REQUEST"):
                     try:
                         s_b = database.create_session()
@@ -1783,10 +1784,10 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     # while dropping a genuinely-inactive one even in BLE range).
     status = response_module.active_status(db, params.uuids)
     inactive = [h for h, active in status.items() if not active]
-    # Blocked combinations (user_user.is_active=0, either direction) over ALL queried peers — reported
-    # EXPLICITLY (like `inactive`) so the app hides them even while in BLE range, and un-hides the instant
-    # the block is removed (row gone or is_active=1, e.g. they became friends). A blocked peer is also kept
-    # out of `online`.
+    # Blocked combinations (user_user.is_active=0, either direction, block_ts not yet expired) over ALL
+    # queried peers — reported EXPLICITLY (like `inactive`) so the app hides them even while in BLE range,
+    # and un-hides the instant the block ends (block_ts passes, row gone or is_active=1, e.g. they became
+    # friends). A blocked peer is also kept out of `online`.
     blocked = list(response_module.blocked_peer_set(db, params.uuid, params.uuids))
     online = [u for u in connected if status.get(u, False) and u not in blocked]
     # Peers not open to making new friends (is_open_for_new=0) — reported separately (like `inactive`/
@@ -1805,8 +1806,9 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
             "connected": [u for u in connected if u not in blocked and u not in hidden_live],
             "hiddenLive": list(hidden_live)}
 
-# Permanently blocks a peer for this user: marks (or creates) their user_user link is_active = 0, so
-# the combination disappears from nearby + friends and can no longer wake either side. X-API-Key only.
+# Blocks a peer for this user for BLOCK_DURATION_HOURS (8h): marks (or creates) their user_user link
+# is_active = 0 with block_ts = expiry, so the combination disappears from nearby + friends and can no
+# longer wake either side until the block lapses. X-API-Key only.
 @app.post("/v1/block_peer/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def block_peer(params: RequestBlockPeer, db: Session = Depends(get_db)):
     try:

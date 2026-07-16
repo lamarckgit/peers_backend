@@ -1049,16 +1049,19 @@ def add_friend(db: Session, user_hex: str, friend_hex: str):
         if user_uuid == friend_uuid:
             raise Exception("Cannot add yourself as a friend")
 
-        existing = db.execute(
-            text("SELECT 1 FROM user_user WHERE uuid_1 = :u AND uuid_2 = :f"),
+        # A leftover block row (is_active = 0, expired or not — see block_peer) must be REVIVED,
+        # not shadowed by a duplicate insert: becoming friends clears the block. Either direction.
+        result = db.execute(
+            text("""UPDATE user_user SET is_active = 1, block_ts = NULL
+                    WHERE (uuid_1 = :u AND uuid_2 = :f) OR (uuid_1 = :f AND uuid_2 = :u)"""),
             {"u": user_uuid, "f": friend_uuid},
-        ).fetchone()
-        if not existing:
+        )
+        if result.rowcount == 0:
             db.execute(
                 text("INSERT INTO user_user (uuid_1, uuid_2) VALUES (:u, :f)"),
                 {"u": user_uuid, "f": friend_uuid},
             )
-            db.commit()
+        db.commit()
         return ResponseResult(success=True, error="")
 
     except SQLAlchemyError as e:
@@ -1117,10 +1120,18 @@ def are_friends(db: Session, hex_a: str, hex_b: str) -> bool:
     except SQLAlchemyError:
         return False
 
+# How long a block lasts. Written into user_user.block_ts as an expiry datetime by block_peer;
+# is_blocked / blocked_peer_set only honour a block while block_ts > NOW().
+BLOCK_DURATION_HOURS = 8
+
 def block_peer(db: Session, user_hex: str, blocked_hex: str):
-    """Permanently blocks the combination of two peers by marking their user_user link is_active = 0
-    (creating the link if none exists). A blocked combination is excluded everywhere — are_friends,
-    get_friends and peers_online all require is_active = 1. Idempotent; either direction is matched."""
+    """Blocks the combination of two peers for BLOCK_DURATION_HOURS by marking their user_user link
+    is_active = 0 (creating the link if none exists) and stamping block_ts with the expiry datetime.
+    While the block is live (block_ts > NOW()) the combination is excluded everywhere — are_friends,
+    get_friends, peers_online and the relay. Once block_ts passes, is_blocked/blocked_peer_set stop
+    reporting it — the pair simply reappear to each other; a prior friendship does NOT come back
+    (the row stays is_active = 0 until a fresh add_friend revives it). Idempotent; re-blocking an
+    already-blocked peer restarts the clock. Either direction is matched."""
     try:
         try:
             u = bytes.fromhex(user_hex)
@@ -1132,14 +1143,15 @@ def block_peer(db: Session, user_hex: str, blocked_hex: str):
         if u == b:
             raise Exception("Cannot block yourself")
         result = db.execute(
-            text("""UPDATE user_user SET is_active = 0
+            text("""UPDATE user_user SET is_active = 0, block_ts = TIMESTAMPADD(HOUR, :h, NOW())
                     WHERE (uuid_1 = :u AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :u)"""),
-            {"u": u, "b": b},
+            {"u": u, "b": b, "h": BLOCK_DURATION_HOURS},
         )
         if result.rowcount == 0:
             db.execute(
-                text("INSERT INTO user_user (uuid_1, uuid_2, is_active) VALUES (:u, :b, 0)"),
-                {"u": u, "b": b},
+                text("""INSERT INTO user_user (uuid_1, uuid_2, is_active, block_ts)
+                        VALUES (:u, :b, 0, TIMESTAMPADD(HOUR, :h, NOW()))"""),
+                {"u": u, "b": b, "h": BLOCK_DURATION_HOURS},
             )
         db.commit()
         return ResponseResult(success=True, error="")
@@ -1149,8 +1161,10 @@ def block_peer(db: Session, user_hex: str, blocked_hex: str):
         raise Exception(f"Exception error: {str(e)}")
 
 def is_blocked(db: Session, hex_a: str, hex_b: str) -> bool:
-    """True if peers a and b are blocked — a user_user link with is_active = 0 in EITHER direction. Used
-    by the relay to refuse to deliver chat messages / call signals between a blocked combination."""
+    """True if peers a and b are LIVE-blocked — a user_user link with is_active = 0 in EITHER direction
+    whose block_ts expiry hasn't passed yet. An expired or NULL block_ts row no longer blocks (the row
+    stays behind, inert, until add_friend revives it or delete_peer removes it). Used by the relay to
+    refuse to deliver chat messages / call signals between a blocked combination."""
     try:
         a = bytes.fromhex(hex_a)
         b = bytes.fromhex(hex_b)
@@ -1161,14 +1175,15 @@ def is_blocked(db: Session, hex_a: str, hex_b: str) -> bool:
     row = db.execute(
         text("""SELECT 1 FROM user_user
                 WHERE ((uuid_1 = :a AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :a))
-                  AND is_active = 0 LIMIT 1"""),
+                  AND is_active = 0 AND block_ts > NOW() LIMIT 1"""),
         {"a": a, "b": b},
     ).fetchone()
     return row is not None
 
 def blocked_peer_set(db: Session, user_hex: str, peer_hexes):
-    """Returns the subset of peer_hexes that are BLOCKED with user_hex (a user_user link with
-    is_active = 0 in either direction), so peers_online can drop them from the nearby list."""
+    """Returns the subset of peer_hexes that are LIVE-blocked with user_hex (a user_user link with
+    is_active = 0 in either direction and block_ts still in the future), so peers_online can drop
+    them from the nearby list. Expired blocks simply stop matching — the peer reappears."""
     try:
         me = bytes.fromhex(user_hex)
     except (ValueError, TypeError):
@@ -1186,7 +1201,7 @@ def blocked_peer_set(db: Session, user_hex: str, peer_hexes):
         row = db.execute(
             text("""SELECT 1 FROM user_user
                     WHERE ((uuid_1 = :me AND uuid_2 = :p) OR (uuid_1 = :p AND uuid_2 = :me))
-                      AND is_active = 0 LIMIT 1"""),
+                      AND is_active = 0 AND block_ts > NOW() LIMIT 1"""),
             {"me": me, "p": p},
         ).fetchone()
         if row:
