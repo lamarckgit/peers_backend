@@ -958,7 +958,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     # (backgrounded/killed): chat request, call request/cancel + the friend handshake.
                     # CALL_CANCEL matters because the ring itself may have been push-delivered: without
                     # a cancel push the backgrounded receiver keeps ringing until its own timeout.
-                    elif msg_type in ("CHAT_REQUEST", "CALL_REQUEST", "CALL_CANCEL", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND", "GROUP_INVITE"):
+                    elif msg_type in ("CHAT_REQUEST", "CHAT_CLOSE", "CALL_REQUEST", "CALL_CANCEL", "FRIEND_REQUEST", "FRIEND_ACCEPT", "NOFRIEND", "UNFRIEND", "GROUP_INVITE"):
                         try:
                             s = database.create_session()
                             try:
