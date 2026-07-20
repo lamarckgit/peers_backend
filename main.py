@@ -1729,6 +1729,31 @@ async def nearby_wake(params: RequestUuid, db: Session = Depends(get_db)):
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# Transitively-CONFIRMED nearby peers ("witnessed"): a witness W pinged BOTH the caller and P
+# within the fresh window, so P is within ~2x BLE range of the caller. Every PEER_NEARBY ping is
+# radio-gated at its sender (<30s own-radio evidence, both platforms), so BOTH edges are real
+# proximity — this cannot resurrect the far-away-ghost bug; worst case P is one room farther than
+# direct range. Consumer: Android, which cannot radio-see a BACKGROUNDED iPhone (Apple overflow
+# advertising) and after a restart has no cached address to verify — the iPhones around them
+# supply the proof instead. Pure read over recent_proximity: no new reporting, no pushes.
+WITNESS_FRESH = 75.0   # seconds; matches the clients' ~60s proof windows with headroom
+
+@app.post("/v1/nearby_witnessed/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def nearby_witnessed(params: RequestUuid):
+    try:
+        now = time.time()
+        me = params.uuid
+        witnessed = set()
+        for w, ts in (recent_proximity.get(me) or {}).items():
+            if now - ts > WITNESS_FRESH:
+                continue
+            for p, ts2 in (recent_proximity.get(w) or {}).items():
+                if p != me and now - ts2 <= WITNESS_FRESH:
+                    witnessed.add(p)
+        return JSONResponse(content={"success": True, "error": "", "peers": list(witnessed)})
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # iOS re-pings PEER_NEARBY over REST while its relay socket is suspended in the background (a BLE
 # wake-up is long enough for one HTTP POST, not for a socket resume). Injects the exact frame the
 # WS relay would route, so the receiver's signalled-nearby bootstrap stays fresh; an offline target
