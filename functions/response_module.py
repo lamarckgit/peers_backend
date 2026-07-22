@@ -1270,13 +1270,19 @@ def get_friends(db: Session, user_hex: str):
     if len(user_uuid) != 16:
         raise Exception("Invalid uuid")
 
+    # `name` is the effective name THIS user sees: their per-link custom nickname if set, else the
+    # friend's own account name. `account_name` always carries the original (so the client can offer
+    # a "restore" when a nickname is set). uuid_1_name = the name uuid_2 uses for uuid_1; uuid_2_name
+    # = the name uuid_1 uses for uuid_2 — so when I'm uuid_1 my nickname for the friend is uuid_2_name.
     rows = db.execute(
         text("""
-        SELECT u.uuid AS fuid, u.name AS name, u.about_me AS about_me
+        SELECT u.uuid AS fuid, COALESCE(NULLIF(uu.uuid_2_name, ''), u.name) AS name,
+               u.name AS account_name, u.about_me AS about_me
         FROM user_user uu JOIN user u ON u.uuid = uu.uuid_2
         WHERE uu.uuid_1 = :me AND uu.is_active = 1
         UNION
-        SELECT u.uuid AS fuid, u.name AS name, u.about_me AS about_me
+        SELECT u.uuid AS fuid, COALESCE(NULLIF(uu.uuid_1_name, ''), u.name) AS name,
+               u.name AS account_name, u.about_me AS about_me
         FROM user_user uu JOIN user u ON u.uuid = uu.uuid_1
         WHERE uu.uuid_2 = :me AND uu.is_active = 1
         """),
@@ -1284,9 +1290,41 @@ def get_friends(db: Session, user_hex: str):
     ).mappings().fetchall()
 
     return [
-        {"uuid": r["fuid"].hex(), "name": r["name"] or "", "about_me": r["about_me"] or ""}
+        {"uuid": r["fuid"].hex(), "name": r["name"] or "",
+         "account_name": r["account_name"] or "", "about_me": r["about_me"] or ""}
         for r in rows
     ]
+
+
+def set_friend_name(db: Session, user_hex: str, friend_hex: str, name: str):
+    """Set (or clear) the custom name USER uses for FRIEND — a per-link nickname in
+    user_user.uuid_1_name / uuid_2_name. An empty/blank name clears it (→ NULL), reverting to the
+    friend's own account name. No-op if the two aren't linked. Column is chosen by side, never from
+    user input, so the f-string interpolation is safe."""
+    try:
+        me = bytes.fromhex(user_hex)
+        fr = bytes.fromhex(friend_hex)
+    except (ValueError, TypeError):
+        raise Exception("Invalid uuid")
+    if len(me) != 16 or len(fr) != 16:
+        raise Exception("Invalid uuid")
+    row = db.execute(
+        text("""SELECT uuid_1 FROM user_user
+                WHERE (uuid_1 = :me AND uuid_2 = :fr) OR (uuid_1 = :fr AND uuid_2 = :me) LIMIT 1"""),
+        {"me": me, "fr": fr},
+    ).first()
+    if not row:
+        return {"success": False, "error": "Not friends"}
+    value = (name or "").strip() or None
+    # I'm uuid_1 → the friend is uuid_2 → my name for them is uuid_2_name; else uuid_1_name.
+    col = "uuid_2_name" if row[0] == me else "uuid_1_name"
+    db.execute(
+        text(f"""UPDATE user_user SET {col} = :v
+                 WHERE (uuid_1 = :me AND uuid_2 = :fr) OR (uuid_1 = :fr AND uuid_2 = :me)"""),
+        {"v": value, "me": me, "fr": fr},
+    )
+    db.commit()
+    return {"success": True}
 
 # --- Groups ------------------------------------------------------------------------------------------
 # A `group` row is (id AUTO_INCREMENT, group_name, admin_user_uuid BINARY(16)). Membership lives in

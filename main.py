@@ -1184,6 +1184,11 @@ class RequestBlockPeer(BaseModel):
     uuid: str          # the blocker (authenticated by check_peer_uuid)
     blocked_uuid: str  # the peer being blocked
 
+class RequestSetFriendName(BaseModel):
+    uuid: str          # the user setting the nickname (authenticated by check_peer_uuid)
+    friend_uuid: str   # the friend being renamed (for THIS user only)
+    name: str = ""     # the custom name; empty clears it (→ revert to the account name)
+
 # --- Groups ---
 class RequestCreateGroup(BaseModel):
     uuid: str          # the creator / admin (authenticated)
@@ -1853,6 +1858,17 @@ async def block_peer(params: RequestBlockPeer, db: Session = Depends(get_db)):
 async def add_friend(params: RequestAddFriend, db: Session = Depends(get_db)):
     try:
         return response_module.add_friend(db, params.uuid, params.friend_uuid)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Sets (or clears, when name is empty) the custom name THIS user uses for a friend — a per-link
+# nickname stored in user_user. Reflected in the next get_friends as the friend's effective `name`.
+@app.post("/v1/set_friend_name/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def set_friend_name(params: RequestSetFriendName, db: Session = Depends(get_db)):
+    try:
+        return response_module.set_friend_name(db, params.uuid, params.friend_uuid, params.name)
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:
