@@ -867,13 +867,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     manager.clear_live(target_id, data.get("msgId"))
 
                 # A photo / contact / (static) location message can't have its payload carried by the
-                # offline push. ALWAYS queue it for friends (independent of the live send below — a killed
-                # app can leave a stale socket that accepts the write, so "delivered" isn't reliable). The
-                # receiver de-dups by msgId, so an online receiver that already got it ignores the flush.
-                # The queue is byte-bounded (MAX_PENDING_BYTES), so queued photos can't exhaust memory.
+                # offline push — and neither can a REPLY's quote (the push carries only text + msgId).
+                # ALWAYS queue these for friends (independent of the live send below — a killed app can
+                # leave a stale socket that accepts the write, so "delivered" isn't reliable). The
+                # receiver de-dups by msgId (and UPGRADES a quote-less push placeholder), so an online
+                # receiver that already got it ignores the flush. The queue is byte-bounded.
                 if (msg_type == "CHAT_MESSAGE" and not data.get("liveUntil")
                         and (data.get("contactCard") or data.get("imageData") or data.get("audioData")
-                             or data.get("videoId") or data.get("docId") or data.get("latitude") is not None)):
+                             or data.get("videoId") or data.get("docId") or data.get("latitude") is not None
+                             or data.get("quotedText") or data.get("quotedAuthorName"))):
                     try:
                         s_q = database.create_session()
                         try:
@@ -882,7 +884,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 kind = ("photo" if data.get("imageData") else "audio" if data.get("audioData")
                                         else "video" if data.get("videoId")
                                         else "document" if data.get("docId")
-                                        else "contact" if data.get("contactCard") else "location")
+                                        else "contact" if data.get("contactCard")
+                                        else "location" if data.get("latitude") is not None else "reply")
                                 print(f"relay: queued {kind} for {target_id[:8]}")
                         finally:
                             s_q.close()
@@ -944,7 +947,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                         ok = response_module.send_chat_message_push(
                                             fcm_token, client_id, sender_name,
                                             data.get("text") or "", badge, data.get("msgId") or "",
-                                            video_id=data.get("videoId") or "", kind_label=kind_label)
+                                            video_id=data.get("videoId") or "", kind_label=kind_label,
+                                            quoted_text=data.get("quotedText") or "",
+                                            quoted_author=data.get("quotedAuthorName") or "")
                                         print(f"relay: chat-msg push to {target_id[:8]} sent={ok} badge={badge}")
                                     else:
                                         print(f"relay: offline friend {target_id[:8]} has no push token")

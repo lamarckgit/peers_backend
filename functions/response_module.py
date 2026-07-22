@@ -767,7 +767,8 @@ def send_silent_wake(target_token: str) -> bool:
 
 
 def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str, text: str, badge: int,
-                           msg_id: str = "", video_id: str = "", kind_label: str = "") -> bool:
+                           msg_id: str = "", video_id: str = "", kind_label: str = "",
+                           quoted_text: str = "", quoted_author: str = "") -> bool:
     """Visible 'new message' push for a FRIEND's chat message to an offline/backgrounded peer:
       • aps.alert (title = sender name, body = the message text) → a real banner on the lock screen
         / a notification while the receiver is in another app,
@@ -788,6 +789,12 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
     body = text or kind_label or "New message"
     data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
             "text": text or "", "msg_id": msg_id or "", "video_id": video_id or ""}
+    # A Reply's quote rides along (text + author only — small enough for the push size budget; a
+    # quoted IMAGE stays out and is delivered by the reconnect catch-up flush). The app stores these
+    # so a killed-app receiver shows the reply's quote immediately, not just on reconnect.
+    if quoted_text or quoted_author:
+        data["quoted_text"] = (quoted_text or "")[:280]
+        data["quoted_author"] = (quoted_author or "")[:80]
     aps_object = messaging.Aps(
         alert=messaging.ApsAlert(title=name, body=body),
         sound="default",
