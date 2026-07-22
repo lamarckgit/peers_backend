@@ -1314,7 +1314,7 @@ def set_friend_name(db: Session, user_hex: str, friend_hex: str, name: str):
         {"me": me, "fr": fr},
     ).first()
     if not row:
-        return {"success": False, "error": "Not friends"}
+        return ResponseResult(success=False, error="Not friends")
     value = (name or "").strip() or None
     # I'm uuid_1 → the friend is uuid_2 → my name for them is uuid_2_name; else uuid_1_name.
     col = "uuid_2_name" if row[0] == me else "uuid_1_name"
@@ -1324,7 +1324,7 @@ def set_friend_name(db: Session, user_hex: str, friend_hex: str, name: str):
         {"v": value, "me": me, "fr": fr},
     )
     db.commit()
-    return {"success": True}
+    return ResponseResult(success=True, error="")
 
 # --- Groups ------------------------------------------------------------------------------------------
 # A `group` row is (id AUTO_INCREMENT, group_name, admin_user_uuid BINARY(16)). Membership lives in
