@@ -1457,6 +1457,213 @@ def delete_group(db: Session, group_id: int):
     db.commit()
     return ResponseResult(success=True, error="")
 
+# --- Polls -----------------------------------------------------------------------------------------
+# A `poll` row is (id AUTO_INCREMENT, admin_user_uuid BINARY(16) = the creator, group_id = set when the
+# poll lives in a group chat, user_uuid BINARY(16) = the OTHER peer when it lives in a 1:1 chat,
+# question, multiple_answers 0/1). Its choices live in `poll_option` (id AUTO_INCREMENT, poll_id,
+# option_text, option_answer) and the votes in `poll_answer` (user_id BINARY(16) = the voter,
+# poll_answer_id = the chosen poll_option.id — one row per vote, so a multiple-answers poll has one
+# row per ticked option). The poll message itself rides the chat relay (pollId on a CHAT_MESSAGE);
+# these tables only persist the poll content + votes so every device renders live results.
+
+# When a vote was cast (the app's "View votes" dialog): every table carries the standard
+# created_ts/modified_ts TIMESTAMP(6) columns (current_timestamp defaults), so a poll_answer row's
+# modified_ts IS the vote time — votes are replaced (delete + insert), never updated in place.
+
+def create_poll(db: Session, admin_hex: str, question: str, multiple_answers: bool, options,
+                group_id: int = 0, peer_hex: str = ""):
+    """Creates a poll owned by admin_hex with its options. Returns {"poll_id", "option_ids"} (the
+    option ids in the order given, so the client can map them back to its rows)."""
+    admin_uuid = _peer_uuid_bytes(admin_hex)
+    q = (question or "").strip()
+    if not q:
+        raise Exception("Empty question")
+    opts = [o for o in ((t or "").strip() for t in options) if o]
+    if len(opts) < 2:
+        raise Exception("A poll needs at least 2 options")
+    peer_uuid = _peer_uuid_bytes(peer_hex) if peer_hex else None
+    result = db.execute(
+        text("""INSERT INTO poll (admin_user_uuid, group_id, user_uuid, question, multiple_answers)
+                VALUES (:a, :g, :u, :q, :m)"""),
+        {"a": admin_uuid, "g": group_id or None, "u": peer_uuid,
+         "q": q, "m": 1 if multiple_answers else 0},
+    )
+    poll_id = int(result.lastrowid)
+    option_ids = []
+    for o in opts:
+        r = db.execute(
+            text("INSERT INTO poll_option (poll_id, option_text, option_answer) VALUES (:p, :t, 0)"),
+            {"p": poll_id, "t": o},
+        )
+        option_ids.append(int(r.lastrowid))
+    db.commit()
+    return {"poll_id": poll_id, "option_ids": option_ids}
+
+def get_poll(db: Session, user_hex: str, poll_id: int):
+    """The poll + its options with live results, from user_hex's perspective: each option carries its
+    vote count, the voters (uuid + account name + when they voted, for the "View votes" dialog) and
+    `mine` (whether THIS user ticked it). None if the poll doesn't exist (deleted → grey bubble)."""
+    user_uuid = _peer_uuid_bytes(user_hex)
+    row = db.execute(
+        text("""SELECT admin_user_uuid, group_id, user_uuid, question, multiple_answers,
+                       is_pinned, pinned_until
+                FROM poll WHERE id = :p"""),
+        {"p": poll_id},
+    ).mappings().fetchone()
+    if not row:
+        return None
+    opts = db.execute(
+        text("SELECT id, option_text FROM poll_option WHERE poll_id = :p ORDER BY id"),
+        {"p": poll_id},
+    ).mappings().fetchall()
+    votes = db.execute(
+        text("""SELECT pa.poll_answer_id AS oid, pa.user_uuid AS voter, u.name AS name,
+                       pa.modified_ts AS ts
+                FROM poll_answer pa
+                JOIN poll_option po ON po.id = pa.poll_answer_id
+                LEFT JOIN user u ON u.uuid = pa.user_uuid
+                WHERE po.poll_id = :p"""),
+        {"p": poll_id},
+    ).mappings().fetchall()
+    by_option = {}
+    voters = set()
+    for v in votes:
+        ts = v["ts"]
+        by_option.setdefault(int(v["oid"]), []).append(
+            {"uuid": v["voter"], "name": v["name"] or "",
+             "ts": ts.timestamp() if ts is not None else None})
+        voters.add(v["voter"])
+    def option_voters(oid):
+        vs = sorted(by_option.get(oid, []), key=lambda d: d["ts"] or 0)   # oldest vote first
+        return [{"uuid": d["uuid"].hex(), "name": d["name"], "ts": d["ts"]} for d in vs]
+    return {
+        "poll_id": int(poll_id),
+        "question": row["question"] or "",
+        "multiple_answers": bool(row["multiple_answers"]),
+        "admin_uuid": row["admin_user_uuid"].hex() if row["admin_user_uuid"] else "",
+        "group_id": int(row["group_id"]) if row["group_id"] else 0,
+        "peer_uuid": row["user_uuid"].hex() if row["user_uuid"] else "",
+        "is_pinned": bool(row["is_pinned"]),
+        "pinned_until": row["pinned_until"].timestamp() if row["pinned_until"] else None,
+        "options": [
+            {"id": int(o["id"]), "text": o["option_text"] or "",
+             "votes": len(by_option.get(int(o["id"]), [])),
+             "voters": option_voters(int(o["id"])),
+             "mine": any(d["uuid"] == user_uuid for d in by_option.get(int(o["id"]), []))}
+            for o in opts
+        ],
+        "total_voters": len(voters),
+    }
+
+def answer_poll(db: Session, user_hex: str, poll_id: int, option_ids):
+    """REPLACES user_hex's vote on a poll with the given option ids (a single-answer poll keeps only
+    the first; an empty list retracts the vote). Foreign option ids (not this poll's) are dropped.
+    Returns the updated poll (get_poll shape) so the voter renders fresh results in one round trip."""
+    user_uuid = _peer_uuid_bytes(user_hex)
+    row = db.execute(
+        text("SELECT multiple_answers FROM poll WHERE id = :p"), {"p": poll_id}
+    ).mappings().fetchone()
+    if not row:
+        raise Exception("Poll not found")
+    valid = {int(r[0]) for r in db.execute(
+        text("SELECT id FROM poll_option WHERE poll_id = :p"), {"p": poll_id}
+    ).fetchall()}
+    chosen = [int(o) for o in option_ids if int(o) in valid]
+    if not bool(row["multiple_answers"]):
+        chosen = chosen[:1]
+    db.execute(
+        text("""DELETE pa FROM poll_answer pa
+                JOIN poll_option po ON po.id = pa.poll_answer_id
+                WHERE pa.user_uuid = :u AND po.poll_id = :p"""),
+        {"u": user_uuid, "p": poll_id},
+    )
+    for oid in chosen:
+        # created_ts/modified_ts default to current_timestamp — the row's modified_ts IS the vote time.
+        db.execute(
+            text("INSERT INTO poll_answer (user_uuid, poll_answer_id) VALUES (:u, :o)"),
+            {"u": user_uuid, "o": oid},
+        )
+    db.commit()
+    return get_poll(db, user_hex, poll_id)
+
+def pin_poll(db: Session, poll_id: int, hours: int):
+    """Pins a poll: is_pinned = 1 and pinned_until = NOW() + `hours`. Any party may pin (the endpoint
+    decides whether the pin is fanned out — only the creator's is). Returns the new pinned_until as
+    epoch seconds, for the client's local pinned reference."""
+    db.execute(
+        text("UPDATE poll SET is_pinned = 1, pinned_until = DATE_ADD(NOW(), INTERVAL :h HOUR) WHERE id = :p"),
+        {"h": max(1, int(hours)), "p": poll_id},
+    )
+    db.commit()
+    row = db.execute(
+        text("SELECT pinned_until FROM poll WHERE id = :p"), {"p": poll_id}
+    ).mappings().fetchone()
+    if not row:
+        raise Exception("Poll not found")
+    return row["pinned_until"].timestamp() if row["pinned_until"] else None
+
+def unpin_poll(db: Session, poll_id: int):
+    """Clears a poll's pin: is_pinned = 0, pinned_until = NULL. Idempotent."""
+    db.execute(text("UPDATE poll SET is_pinned = 0, pinned_until = NULL WHERE id = :p"), {"p": poll_id})
+    db.commit()
+    return ResponseResult(success=True, error="")
+
+def poll_admin_hex(db: Session, poll_id: int):
+    """The hex uuid of a poll's creator, or None if the poll doesn't exist."""
+    row = db.execute(
+        text("SELECT admin_user_uuid FROM poll WHERE id = :p"), {"p": poll_id}
+    ).mappings().fetchone()
+    return row["admin_user_uuid"].hex() if row and row["admin_user_uuid"] else None
+
+def poll_party_hexes(db: Session, poll_id: int):
+    """Everyone who should hear about a vote (POLL_UPDATE fan-out): the members of the poll's group,
+    or — for a 1:1 poll — the creator and the other peer. Empty if the poll is gone."""
+    row = db.execute(
+        text("SELECT admin_user_uuid, group_id, user_uuid FROM poll WHERE id = :p"), {"p": poll_id}
+    ).mappings().fetchone()
+    if not row:
+        return []
+    if row["group_id"]:
+        return group_member_hexes(db, int(row["group_id"]))
+    parties = [row["admin_user_uuid"].hex()] if row["admin_user_uuid"] else []
+    if row["user_uuid"]:
+        parties.append(row["user_uuid"].hex())
+    return parties
+
+def delete_poll(db: Session, poll_id: int):
+    """Deletes a poll with its options and votes (creator-only — the endpoint authorises). Idempotent."""
+    db.execute(
+        text("""DELETE pa FROM poll_answer pa
+                JOIN poll_option po ON po.id = pa.poll_answer_id
+                WHERE po.poll_id = :p"""),
+        {"p": poll_id},
+    )
+    db.execute(text("DELETE FROM poll_option WHERE poll_id = :p"), {"p": poll_id})
+    db.execute(text("DELETE FROM poll WHERE id = :p"), {"p": poll_id})
+    db.commit()
+    return ResponseResult(success=True, error="")
+
+def clear_group_polls(db: Session, group_id: int):
+    """Deletes ALL of a group's polls — options and votes included, whoever created them — used when
+    the group admin clears the whole group chat history (the endpoint authorises the admin; the chat
+    bubbles disappear via the admin's GROUP_DELETE/GROUP_CLEAR fan-out). Idempotent."""
+    db.execute(
+        text("""DELETE pa FROM poll_answer pa
+                JOIN poll_option po ON po.id = pa.poll_answer_id
+                JOIN poll p ON p.id = po.poll_id
+                WHERE p.group_id = :g"""),
+        {"g": group_id},
+    )
+    db.execute(
+        text("""DELETE po FROM poll_option po
+                JOIN poll p ON p.id = po.poll_id
+                WHERE p.group_id = :g"""),
+        {"g": group_id},
+    )
+    db.execute(text("DELETE FROM poll WHERE group_id = :g"), {"g": group_id})
+    db.commit()
+    return ResponseResult(success=True, error="")
+
 def filter_active_peers(db: Session, peer_hexes):
     """Given a list of hex uuids, returns those whose user row has is_active = 1 (i.e. the peer
     hasn't set themselves inactive). Inactive peers are dropped so they disappear from other phones'

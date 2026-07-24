@@ -874,7 +874,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # receiver that already got it ignores the flush. The queue is byte-bounded.
                 if (msg_type == "CHAT_MESSAGE" and not data.get("liveUntil")
                         and (data.get("contactCard") or data.get("imageData") or data.get("audioData")
-                             or data.get("videoId") or data.get("docId") or data.get("latitude") is not None
+                             or data.get("videoId") or data.get("docId") or data.get("pollId")
+                             or data.get("latitude") is not None
                              or data.get("quotedText") or data.get("quotedAuthorName"))):
                     try:
                         s_q = database.create_session()
@@ -884,6 +885,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 kind = ("photo" if data.get("imageData") else "audio" if data.get("audioData")
                                         else "video" if data.get("videoId")
                                         else "document" if data.get("docId")
+                                        else "poll" if data.get("pollId")
                                         else "contact" if data.get("contactCard")
                                         else "location" if data.get("latitude") is not None else "reply")
                                 print(f"relay: queued {kind} for {target_id[:8]}")
@@ -943,6 +945,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                                       else "📷 Photo" if data.get("imageData")
                                                       else "🎤 Voice message" if data.get("audioData")
                                                       else "👤 Contact" if data.get("contactCard")
+                                                      else "📊 Poll" if data.get("pollId")
                                                       else "📍 Location" if data.get("latitude") is not None else "")
                                         ok = response_module.send_chat_message_push(
                                             fcm_token, client_id, sender_name,
@@ -1221,6 +1224,29 @@ class RequestUpdateGroupImage(BaseModel):
     uuid: str
     group_id: int
     image_data: str    # base64 JPEG
+
+# --- Polls ---
+class RequestCreatePoll(BaseModel):
+    uuid: str                       # the creator / poll admin (authenticated)
+    question: str
+    multiple_answers: bool = False  # True = voters may tick several options
+    options: List[str]              # at least 2 non-empty option texts
+    group_id: int = 0               # set when the poll lives in a GROUP chat
+    peer_uuid: str = ""             # set when the poll lives in a 1:1 chat (the other peer)
+
+class RequestPollId(BaseModel):
+    uuid: str                       # the caller (authenticated; must be the admin for delete)
+    poll_id: int
+
+class RequestAnswerPoll(BaseModel):
+    uuid: str                       # the voter (authenticated)
+    poll_id: int
+    option_ids: List[int]           # the chosen option(s); REPLACES any previous vote ([] retracts)
+
+class RequestPinPoll(BaseModel):
+    uuid: str                       # the pinner (authenticated; any poll party)
+    poll_id: int
+    hours: int                      # pin duration: 24 / 72 (3 days) / 168 (1 week) / 720 (1 month)
 
 class RequestActivateUser(BaseModel):
     uuid: str
@@ -2043,6 +2069,159 @@ async def delete_group(params: RequestGroupId, db: Session = Depends(get_db)):
         except Exception as img_err:
             print(f"delete_group image remove failed: {img_err}")
         return result
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# --- Polls ------------------------------------------------------------------------------------------
+# Creates a poll (creator = the caller) with its options. The poll message itself is sent by the app
+# over the chat relay (a CHAT_MESSAGE carrying pollId), so the backend only persists content + votes.
+@app.post("/v1/create_poll/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def create_poll(params: RequestCreatePoll, db: Session = Depends(get_db)):
+    try:
+        result = response_module.create_poll(db, params.uuid, params.question, params.multiple_answers,
+                                             params.options, params.group_id, params.peer_uuid)
+        return {"success": True, **result, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Returns a poll + its options with live results (vote counts, voter uuids, the caller's own ticks).
+# exists=False (HTTP 200) when the poll was deleted, so the app can grey the stale bubble.
+@app.post("/v1/get_poll/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def get_poll(params: RequestPollId, db: Session = Depends(get_db)):
+    try:
+        poll = response_module.get_poll(db, params.uuid, params.poll_id)
+        if poll is None:
+            return {"success": False, "exists": False, "error": "Poll not found"}
+        return {"success": True, "exists": True, "poll": poll, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Replaces the caller's vote on a poll (an empty option_ids retracts it). Returns the updated poll,
+# and nudges every other party (the 1:1 peer / the group members, on all their devices) with a live
+# POLL_UPDATE over the relay so open bubbles refresh instantly. No queue/push: a bubble re-fetches
+# its results on appear anyway, so an offline device simply catches up when it next shows the poll.
+@app.post("/v1/answer_poll/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def answer_poll(params: RequestAnswerPoll, db: Session = Depends(get_db)):
+    try:
+        poll = response_module.answer_poll(db, params.uuid, params.poll_id, params.option_ids)
+        try:
+            notice = {"type": "POLL_UPDATE", "sender": params.uuid, "pollId": params.poll_id}
+            for party in response_module.poll_party_hexes(db, params.poll_id):
+                if party.lower() == params.uuid.lower():
+                    continue
+                await manager.send_all(party, notice)
+        except Exception as notify_err:
+            print(f"answer_poll notify error: {notify_err}")
+        return {"success": True, "poll": poll, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Pins a poll: is_pinned = 1, pinned_until = NOW() + hours. CREATOR only — a non-creator's pin is a
+# purely local affair on their own device (never wired to the backend). The backend fans a live
+# POLL_PIN to every other party so their chat screens show the pinned reference bar too.
+@app.post("/v1/pin_poll/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def pin_poll(params: RequestPinPoll, db: Session = Depends(get_db)):
+    try:
+        poll = response_module.get_poll(db, params.uuid, params.poll_id)
+        if poll is None:
+            return {"success": False, "error": "Poll not found"}
+        if poll["admin_uuid"].lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the poll creator"}, status_code=403)
+        until = response_module.pin_poll(db, params.poll_id, params.hours)
+        try:
+            notice = {"type": "POLL_PIN", "sender": params.uuid, "pollId": params.poll_id,
+                      "pinnedUntil": until, "text": poll["question"]}
+            if poll["group_id"]:
+                notice["groupId"] = poll["group_id"]
+            for party in response_module.poll_party_hexes(db, params.poll_id):
+                if party.lower() == params.uuid.lower():
+                    continue
+                await manager.send_all(party, notice)
+        except Exception as notify_err:
+            print(f"pin_poll notify error: {notify_err}")
+        return {"success": True, "pinned_until": until, "error": ""}
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Unpins a poll: is_pinned = 0, pinned_until = NULL. CREATOR only (a non-creator's unpin only drops
+# their local bar). Fans POLL_UNPIN to every other party so their bars drop too.
+@app.post("/v1/unpin_poll/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def unpin_poll(params: RequestPollId, db: Session = Depends(get_db)):
+    try:
+        poll = response_module.get_poll(db, params.uuid, params.poll_id)
+        if poll is None:
+            return {"success": True, "error": ""}   # already gone — idempotent
+        if poll["admin_uuid"].lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the poll creator"}, status_code=403)
+        result = response_module.unpin_poll(db, params.poll_id)
+        try:
+            notice = {"type": "POLL_UNPIN", "sender": params.uuid, "pollId": params.poll_id}
+            if poll["group_id"]:
+                notice["groupId"] = poll["group_id"]
+            for party in response_module.poll_party_hexes(db, params.poll_id):
+                if party.lower() == params.uuid.lower():
+                    continue
+                await manager.send_all(party, notice)
+        except Exception as notify_err:
+            print(f"unpin_poll notify error: {notify_err}")
+        return result
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Deletes a poll with its options and votes — creator only. The chat bubble is removed everywhere by
+# the normal CHAT_DELETE/GROUP_DELETE flow; additionally every other party gets a live POLL_UPDATE so
+# a bubble whose delete signal races/goes missing re-fetches and greys out (exists=False) immediately,
+# plus a POLL_UNPIN so any pinned-reference bar for the deleted poll drops everywhere too (an offline
+# party's bar is cleaned by its queued CHAT_DELETE/GROUP_DELETE app-side).
+@app.post("/v1/delete_poll/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def delete_poll(params: RequestPollId, db: Session = Depends(get_db)):
+    try:
+        poll = response_module.get_poll(db, params.uuid, params.poll_id)    # BEFORE the delete
+        if poll is None:
+            return response_module.ResponseResult(success=True, error="")   # already gone — idempotent
+        if poll["admin_uuid"].lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the poll creator"}, status_code=403)
+        parties = response_module.poll_party_hexes(db, params.poll_id)
+        result = response_module.delete_poll(db, params.poll_id)
+        try:
+            notice = {"type": "POLL_UPDATE", "sender": params.uuid, "pollId": params.poll_id}
+            unpin = {"type": "POLL_UNPIN", "sender": params.uuid, "pollId": params.poll_id}
+            if poll["group_id"]:
+                unpin["groupId"] = poll["group_id"]
+            for party in parties:
+                if party.lower() == params.uuid.lower():
+                    continue
+                await manager.send_all(party, notice)
+                await manager.send_all(party, unpin)
+        except Exception as notify_err:
+            print(f"delete_poll notify error: {notify_err}")
+        return result
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Deletes ALL of a group's polls from the database — group admin only. Called alongside the admin's
+# "clear the Group Chat history" (which removes the bubbles via GROUP_DELETE/GROUP_CLEAR fan-out).
+@app.post("/v1/clear_group_polls/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def clear_group_polls(params: RequestGroupId, db: Session = Depends(get_db)):
+    try:
+        admin = response_module.group_admin_hex(db, params.group_id)
+        if not admin or admin.lower() != params.uuid.lower():
+            return JSONResponse(content={"success": False, "error": "Not the group admin"}, status_code=403)
+        return response_module.clear_group_polls(db, params.group_id)
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:
