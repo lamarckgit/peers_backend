@@ -16,7 +16,8 @@ import fastapi
 from classes.database_class import Database
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
-from functions import response_module # Not from functions.response_module import * because duplicate method name conflicts
+from functions import response_module
+from functions import attest_module # Not from functions.response_module import * because duplicate method name conflicts
 #from constants import Constants
 from fastapi import FastAPI, Request, HTTPException, Depends, status, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -1087,6 +1088,15 @@ class RequestCreatePeer(BaseModel):
     # "Proof you're human" (pick-the-pear): id + tapped tile index from /v1/human_challenge/.
     challenge_id: Optional[str] = None
     challenge_answer: Optional[int] = None
+    # OR the invisible layer: a single-use pass from /v1/verify_attest/ (App Attest / Play Integrity).
+    attest_pass: Optional[str] = None
+
+class RequestVerifyAttest(BaseModel):
+    nonce_id: str                      # from /v1/attest_nonce/
+    platform: str                      # "apple" (App Attest) | "android" (Play Integrity)
+    key_id: Optional[str] = None       # apple: App Attest key id (base64)
+    attestation: Optional[str] = None  # apple: attestation object (base64 CBOR)
+    integrity_token: Optional[str] = None  # android: Play Integrity token
 
 class RequestUpdatePeer(BaseModel):
     uuid: str
@@ -1638,6 +1648,25 @@ async def get_all_locks(params: RequestRemote, username: response_module.Respons
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# Device attestation (the INVISIBLE human-check layer): a single-use nonce, then verification of
+# the platform attestation for it — App Attest (iOS/Mac) or Play Integrity (Android). A pass from
+# verify_attest lets create_peer skip the pick-the-pear dialog; ANY failure just means the client
+# falls back to the visible pear challenge. X-API-Key only (the caller has no uuid yet).
+@app.post("/v1/attest_nonce/", dependencies=[Depends(verify_api_key)])
+async def attest_nonce():
+    try:
+        return attest_module.issue_nonce()
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@app.post("/v1/verify_attest/", dependencies=[Depends(verify_api_key)])
+async def verify_attest(params: RequestVerifyAttest):
+    try:
+        return attest_module.verify(params.nonce_id, params.platform, params.key_id or "",
+                                    params.attestation or "", params.integrity_token or "")
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # "Proof you're human" (pick-the-pear): issues a single-use challenge for create_peer — shuffled
 # white shape tiles (base64 PNGs from static/challenge_icons; exactly one pear). The client renders
 # them blindly and reports the tapped index; only the server knows the answer. X-API-Key only (the
@@ -1654,14 +1683,19 @@ async def create_peer(params: RequestCreatePeer, db: Session = Depends(get_db)):
     message = ""
     result = False
     peer_hex = ""
-    # Pick-the-pear gate: a supplied challenge is ALWAYS validated (single-use — wrong answer burns
-    # it); once REQUIRE_HUMAN_CHECK is flipped, a request without one is rejected too. The distinct
-    # error string lets clients show "that wasn't the pear" instead of a generic failure.
-    if params.challenge_id is not None or response_module.REQUIRE_HUMAN_CHECK:
+    # Human gate: an ATTEST PASS (invisible App Attest / Play Integrity layer) or a correct
+    # pick-the-pear answer satisfies it; supplied proofs are ALWAYS validated (single-use — a
+    # wrong pear answer burns the challenge). With REQUIRE_HUMAN_CHECK on, a request carrying
+    # neither valid proof is rejected. The distinct error string lets clients show "that wasn't
+    # the pear" instead of a generic failure.
+    human_ok = bool(params.attest_pass) and attest_module.consume_attest_pass(params.attest_pass)
+    if not human_ok and params.challenge_id is not None:
         answer = params.challenge_answer if params.challenge_answer is not None else -1
-        if not response_module.verify_human_challenge(params.challenge_id or "", answer):
-            return JSONResponse(content={"success": False, "error": "human_check_failed"},
-                                status_code=status.HTTP_403_FORBIDDEN)
+        human_ok = response_module.verify_human_challenge(params.challenge_id, answer)
+    if not human_ok and (response_module.REQUIRE_HUMAN_CHECK
+                         or params.challenge_id is not None or params.attest_pass is not None):
+        return JSONResponse(content={"success": False, "error": "human_check_failed"},
+                            status_code=status.HTTP_403_FORBIDDEN)
     try:
         peer = uuid.uuid4()
         peer_bytes = peer.bytes      # 16-byte value stored in the DB

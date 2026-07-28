@@ -429,7 +429,7 @@ _PEER_CODE_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTU
 # always validated, but create_peer only REJECTS a missing one once the flag is flipped.
 import base64 as _b64
 
-REQUIRE_HUMAN_CHECK = False
+REQUIRE_HUMAN_CHECK = True   # flipped 2026-07-28: all 3 clients ship the pear dialog (+ attest layer)
 HUMAN_CHALLENGE_TILES = 6
 HUMAN_CHALLENGE_TTL_S = 120
 _HUMAN_CHALLENGE_CAP = 5000                       # bot-hammering backstop (FIFO eviction)
