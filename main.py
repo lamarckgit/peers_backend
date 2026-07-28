@@ -1186,6 +1186,7 @@ class RequestAddFriend(BaseModel):
 class RequestBlockPeer(BaseModel):
     uuid: str          # the blocker (authenticated by check_peer_uuid)
     blocked_uuid: str  # the peer being blocked
+    permanent: bool = False  # default = the standard 8-hour block; True = never expires
 
 class RequestSetFriendName(BaseModel):
     uuid: str          # the user setting the nickname (authenticated by check_peer_uuid)
@@ -1867,13 +1868,14 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
             "connected": [u for u in connected if u not in blocked and u not in hidden_live],
             "hiddenLive": list(hidden_live)}
 
-# Blocks a peer for this user for BLOCK_DURATION_HOURS (8h): marks (or creates) their user_user link
-# is_active = 0 with block_ts = expiry, so the combination disappears from nearby + friends and can no
-# longer wake either side until the block lapses. X-API-Key only.
+# Blocks a peer for this user: marks (or creates) their user_user link is_active = 0 with block_ts =
+# expiry, so the combination disappears from nearby + friends and can no longer wake either side until
+# the block lapses — BLOCK_DURATION_HOURS (8h) by default, or effectively forever with permanent = true.
+# X-API-Key only.
 @app.post("/v1/block_peer/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def block_peer(params: RequestBlockPeer, db: Session = Depends(get_db)):
     try:
-        return response_module.block_peer(db, params.uuid, params.blocked_uuid)
+        return response_module.block_peer(db, params.uuid, params.blocked_uuid, params.permanent)
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:
