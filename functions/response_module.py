@@ -1130,13 +1130,15 @@ def are_friends(db: Session, hex_a: str, hex_b: str) -> bool:
 # How long a block lasts. Written into user_user.block_ts as an expiry datetime by block_peer;
 # is_blocked / blocked_peer_set only honour a block while block_ts > NOW().
 BLOCK_DURATION_HOURS = 8
-# "Permanent" block = an expiry 100 years out — every block_ts > NOW() check keeps working unchanged.
-PERMANENT_BLOCK_HOURS = 100 * 365 * 24
+# "Permanent" block expiry. block_ts is a MySQL TIMESTAMP, whose range ends 2038-01-19 — an
+# added-100-years value overflowed it (error 1292). A fixed date just under that ceiling is the
+# farthest representable "never": every block_ts > NOW() check keeps working unchanged.
+PERMANENT_BLOCK_TS = "2038-01-01 00:00:00"
 
 def block_peer(db: Session, user_hex: str, blocked_hex: str, permanent: bool = False):
     """Blocks the combination of two peers by marking their user_user link is_active = 0 (creating the
     link if none exists) and stamping block_ts with the expiry datetime — BLOCK_DURATION_HOURS out, or
-    PERMANENT_BLOCK_HOURS (100 years, effectively forever) when permanent is True.
+    PERMANENT_BLOCK_TS (the TIMESTAMP ceiling, effectively forever) when permanent is True.
     While the block is live (block_ts > NOW()) the combination is excluded everywhere — are_friends,
     get_friends, peers_online and the relay. Once block_ts passes, is_blocked/blocked_peer_set stop
     reporting it — the pair simply reappear to each other; a prior friendship does NOT come back
@@ -1152,17 +1154,19 @@ def block_peer(db: Session, user_hex: str, blocked_hex: str, permanent: bool = F
             raise Exception("Invalid uuid")
         if u == b:
             raise Exception("Cannot block yourself")
-        hours = PERMANENT_BLOCK_HOURS if permanent else BLOCK_DURATION_HOURS
+        params = {"u": u, "b": b, "perm": permanent, "ts": PERMANENT_BLOCK_TS,
+                  "h": BLOCK_DURATION_HOURS}
         result = db.execute(
-            text("""UPDATE user_user SET is_active = 0, block_ts = TIMESTAMPADD(HOUR, :h, NOW())
+            text("""UPDATE user_user SET is_active = 0,
+                    block_ts = IF(:perm, TIMESTAMP(:ts), TIMESTAMPADD(HOUR, :h, NOW()))
                     WHERE (uuid_1 = :u AND uuid_2 = :b) OR (uuid_1 = :b AND uuid_2 = :u)"""),
-            {"u": u, "b": b, "h": hours},
+            params,
         )
         if result.rowcount == 0:
             db.execute(
                 text("""INSERT INTO user_user (uuid_1, uuid_2, is_active, block_ts)
-                        VALUES (:u, :b, 0, TIMESTAMPADD(HOUR, :h, NOW()))"""),
-                {"u": u, "b": b, "h": hours},
+                        VALUES (:u, :b, 0, IF(:perm, TIMESTAMP(:ts), TIMESTAMPADD(HOUR, :h, NOW())))"""),
+                params,
             )
         db.commit()
         return ResponseResult(success=True, error="")
