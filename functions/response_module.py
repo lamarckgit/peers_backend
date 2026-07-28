@@ -421,6 +421,50 @@ def set_share_uses(db: Session, link_id):
 # randomness, retried on the (vanishingly rare) collision.
 _PEER_CODE_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+# ---- "Proof you're human" (pick-the-pear) ------------------------------------------------------
+# Issued by /v1/human_challenge/, consumed by create_peer. The client receives ONLY shuffled tile
+# images (it never learns which is the pear), taps one, and sends the index back. In-memory store
+# (single-worker event loop, like the relay's pending_ops): single-use, short expiry, capped.
+# REQUIRE_HUMAN_CHECK stays False until ALL clients ship the dialog — a supplied challenge is
+# always validated, but create_peer only REJECTS a missing one once the flag is flipped.
+import base64 as _b64
+
+REQUIRE_HUMAN_CHECK = False
+HUMAN_CHALLENGE_TILES = 6
+HUMAN_CHALLENGE_TTL_S = 120
+_HUMAN_CHALLENGE_CAP = 5000                       # bot-hammering backstop (FIFO eviction)
+_CHALLENGE_ICON_DIR = "static/challenge_icons"
+_CHALLENGE_DECOYS = ["apple.png", "circle.png", "square.png", "triangle.png",
+                     "diamond.png", "ring.png", "crescent.png", "heart.png"]
+_human_challenges: dict = {}                       # challenge_id -> (answer_index, expires_ts)
+
+def issue_human_challenge() -> dict:
+    """One new single-use challenge: 6 shuffled white-shape tiles (exactly one pear), base64 PNGs.
+    Only the server remembers which index is the pear."""
+    now = time.time()
+    for cid in [c for c, (_, exp) in list(_human_challenges.items()) if exp < now]:
+        _human_challenges.pop(cid, None)
+    while len(_human_challenges) >= _HUMAN_CHALLENGE_CAP:
+        _human_challenges.pop(next(iter(_human_challenges)), None)
+    tiles = random.sample(_CHALLENGE_DECOYS, HUMAN_CHALLENGE_TILES - 1) + ["pear.png"]
+    random.shuffle(tiles)
+    images = []
+    for name in tiles:
+        with open(os.path.join(_CHALLENGE_ICON_DIR, name), "rb") as f:
+            images.append(_b64.b64encode(f.read()).decode())
+    cid = secrets.token_hex(16)
+    _human_challenges[cid] = (tiles.index("pear.png"), now + HUMAN_CHALLENGE_TTL_S)
+    return {"success": True, "challenge_id": cid, "images": images}
+
+def verify_human_challenge(challenge_id: str, answer: int) -> bool:
+    """True only for a live, unexpired challenge answered with the pear's index. Always single-use:
+    a wrong (or expired) answer burns the challenge — the client must fetch a fresh one."""
+    entry = _human_challenges.pop(challenge_id or "", None)
+    if entry is None:
+        return False
+    idx, expires = entry
+    return time.time() <= expires and answer == idx
+
 def generate_peer_code(db: Session) -> str:
     for _ in range(25):
         code = "".join(secrets.choice(_PEER_CODE_ALPHABET) for _ in range(6))

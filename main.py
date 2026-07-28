@@ -1084,6 +1084,9 @@ class RequestCreatePeer(BaseModel):
     name: str
     about_me: Optional[str] = Field(default=None, max_length=ABOUT_ME_MAX_CODEPOINTS)
     image_data: Optional[str] = None
+    # "Proof you're human" (pick-the-pear): id + tapped tile index from /v1/human_challenge/.
+    challenge_id: Optional[str] = None
+    challenge_answer: Optional[int] = None
 
 class RequestUpdatePeer(BaseModel):
     uuid: str
@@ -1635,11 +1638,30 @@ async def get_all_locks(params: RequestRemote, username: response_module.Respons
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# "Proof you're human" (pick-the-pear): issues a single-use challenge for create_peer — shuffled
+# white shape tiles (base64 PNGs from static/challenge_icons; exactly one pear). The client renders
+# them blindly and reports the tapped index; only the server knows the answer. X-API-Key only (the
+# caller has no uuid yet, like create_peer).
+@app.post("/v1/human_challenge/", dependencies=[Depends(verify_api_key)])
+async def human_challenge():
+    try:
+        return response_module.issue_human_challenge()
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 @app.post("/v1/create_peer/", response_model=response_module.ResponseCreatePeer, dependencies=[Depends(verify_api_key)])
 async def create_peer(params: RequestCreatePeer, db: Session = Depends(get_db)):
     message = ""
     result = False
     peer_hex = ""
+    # Pick-the-pear gate: a supplied challenge is ALWAYS validated (single-use — wrong answer burns
+    # it); once REQUIRE_HUMAN_CHECK is flipped, a request without one is rejected too. The distinct
+    # error string lets clients show "that wasn't the pear" instead of a generic failure.
+    if params.challenge_id is not None or response_module.REQUIRE_HUMAN_CHECK:
+        answer = params.challenge_answer if params.challenge_answer is not None else -1
+        if not response_module.verify_human_challenge(params.challenge_id or "", answer):
+            return JSONResponse(content={"success": False, "error": "human_check_failed"},
+                                status_code=status.HTTP_403_FORBIDDEN)
     try:
         peer = uuid.uuid4()
         peer_bytes = peer.bytes      # 16-byte value stored in the DB
