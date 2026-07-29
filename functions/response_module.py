@@ -1522,6 +1522,39 @@ def delete_group(db: Session, group_id: int):
 # created_ts/modified_ts TIMESTAMP(6) columns (current_timestamp defaults), so a poll_answer row's
 # modified_ts IS the vote time — votes are replaced (delete + insert), never updated in place.
 
+# ---- Report a peer (App Store / Play guideline: user-generated content must be reportable) ----
+# Reports land in the user_report table for review. Prerequisite DDL (standard ts columns per the
+# house convention):
+#   CREATE TABLE user_report (
+#     id INT NOT NULL AUTO_INCREMENT,
+#     reporter_uuid BINARY(16) NOT NULL,
+#     reported_uuid BINARY(16) NOT NULL,
+#     reason VARCHAR(64) NOT NULL,
+#     created_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+#     modified_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+#     created_by_id INT DEFAULT NULL,
+#     modified_by_id INT DEFAULT NULL,
+#     PRIMARY KEY (id)
+#   );
+
+def report_peer(db: Session, reporter_hex: str, reported_hex: str, reason: str):
+    """Files a report of reported_hex by reporter_hex with a short reason label. The row is the
+    review queue — check it regularly (guidelines expect action on objectionable-content reports
+    within 24h)."""
+    reporter = _peer_uuid_bytes(reporter_hex)
+    reported = _peer_uuid_bytes(reported_hex)
+    if reporter == reported:
+        raise Exception("Cannot report yourself")
+    why = (reason or "").strip()[:64] or "Unspecified"
+    db.execute(
+        text("""INSERT INTO user_report (reporter_uuid, reported_uuid, reason)
+                VALUES (:r, :t, :w)"""),
+        {"r": reporter, "t": reported, "w": why},
+    )
+    db.commit()
+    print(f"report: {reporter_hex[:8]} reported {reported_hex[:8]} — {why}")
+    return ResponseResult(success=True, error="")
+
 def create_poll(db: Session, admin_hex: str, question: str, multiple_answers: bool, options,
                 group_id: int = 0, peer_hex: str = ""):
     """Creates a poll owned by admin_hex with its options. Returns {"poll_id", "option_ids"} (the

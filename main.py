@@ -1091,6 +1091,11 @@ class RequestCreatePeer(BaseModel):
     # OR the invisible layer: a single-use pass from /v1/verify_attest/ (App Attest / Play Integrity).
     attest_pass: Optional[str] = None
 
+class RequestReportPeer(BaseModel):
+    uuid: str           # the reporter (authenticated by check_peer_uuid)
+    reported_uuid: str  # the peer being reported
+    reason: str         # short label from the client's reason list
+
 class RequestVerifyAttest(BaseModel):
     nonce_id: str                      # from /v1/attest_nonce/
     platform: str                      # "apple" (App Attest) | "android" (Play Integrity)
@@ -1923,6 +1928,17 @@ async def peers_online(params: RequestPeersOnline, db: Session = Depends(get_db)
     return {"online": online, "inactive": inactive, "blocked": blocked, "closed": closed,
             "connected": [u for u in connected if u not in blocked and u not in hidden_live],
             "hiddenLive": list(hidden_live)}
+
+# Files a report of a peer (App Store / Play "user-generated content" guideline): stored in the
+# user_report table for review. X-API-Key + check_peer_uuid (the reporter must be a real peer).
+@app.post("/v1/report_peer/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def report_peer(params: RequestReportPeer, db: Session = Depends(get_db)):
+    try:
+        return response_module.report_peer(db, params.uuid, params.reported_uuid, params.reason)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # Blocks a peer for this user: marks (or creates) their user_user link is_active = 0 with block_ts =
 # expiry, so the combination disappears from nearby + friends and can no longer wake either side until
