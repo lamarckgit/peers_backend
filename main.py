@@ -393,6 +393,47 @@ class ConnectionManager:
             if not bucket:
                 self.live_positions.pop(target_id, None)
 
+    def purge_queued(self, uuid: str, predicate) -> int:
+        """Drop queued MESSAGE frames for `uuid` matching `predicate(frame)` — from the per-device
+        echo queues (their cache files included) and the legacy pending queue. Ops (edits/deletes/
+        reads) are never dropped. Needed because the reconnect flush sends OPS BEFORE FRAMES: a
+        queued copy of a deleted message would arrive after its CHAT_DELETE and RESURRECT the
+        bubble — and its (possibly large) payload would sit on disk until ECHO_CACHE_MAX_AGE."""
+        removed = 0
+        per_device = self.echo_queue.get(uuid)
+        if per_device:
+            for dev in list(per_device):
+                kept = deque()
+                for frame, size, path in per_device[dev]:
+                    if (frame.get("type") or "").endswith("_MESSAGE") and predicate(frame):
+                        self._echo_bytes -= size
+                        self._delete_frame(path)
+                        removed += 1
+                    else:
+                        kept.append((frame, size, path))
+                if kept:
+                    per_device[dev] = kept
+                else:
+                    per_device.pop(dev, None)
+            if not per_device:
+                self.echo_queue.pop(uuid, None)
+        seqs = self.pending_by_peer.get(uuid)
+        if seqs:
+            kept_seqs = deque()
+            for seq in seqs:
+                entry = self.pending_ops.get(seq)
+                if entry and (entry[1].get("type") or "").endswith("_MESSAGE") and predicate(entry[1]):
+                    self.pending_ops.pop(seq, None)
+                    self._pending_bytes -= entry[2]
+                    removed += 1
+                else:
+                    kept_seqs.append(seq)
+            if kept_seqs:
+                self.pending_by_peer[uuid] = kept_seqs
+            else:
+                self.pending_by_peer.pop(uuid, None)
+        return removed
+
     def enqueue_echo(self, client_id: str, data: dict, exclude_device: str = None):
         """Queue a chat frame for `client_id`'s KNOWN, echo-capable devices that are currently
         OFFLINE — used for BOTH the sender's own echo (their killed sibling shows what they sent) and
@@ -746,6 +787,20 @@ async def relay_group_message(client_id: str, data: dict, msg_type: str, origin_
         s = database.create_session()
         try:
             members = response_module.group_member_hexes(s, group_id)
+            # GROUP_CLEAR = the admin wiped the whole group history: no queued group frame may
+            # resurrect any of it on a member's reconnect.
+            if msg_type == "GROUP_CLEAR":
+                purged = sum(manager.purge_queued(m, lambda f: f.get("groupId") == group_id)
+                             for m in members)
+                if purged:
+                    print(f"relay: purged {purged} queued frame(s) after GROUP_CLEAR (group {group_id})")
+            # A deleted group message must not survive in any member's offline queue (see the 1:1
+            # CHAT_DELETE purge — same op-before-frame resurrection on reconnect).
+            if msg_type == "GROUP_DELETE" and data.get("msgId"):
+                mid = data.get("msgId")
+                purged = sum(manager.purge_queued(m, lambda f: f.get("msgId") == mid) for m in members)
+                if purged:
+                    print(f"relay: purged {purged} queued frame(s) of deleted group msg {mid[:8]}")
             live_only = msg_type == "LOCATION_UPDATE"   # ephemeral positions: live sends only
             sender_name = data.get("senderName") or ""
             if not sender_name and msg_type == "GROUP_MESSAGE":
@@ -859,6 +914,31 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             s_b.close()
                     except Exception as e:
                         print(f"relay block-check error: {e}")
+
+                # A deleted message must not survive in the offline queues: drop any queued copy
+                # (the receiver's devices AND the sender's own sibling echoes) before relaying the
+                # delete itself.
+                if msg_type == "CHAT_DELETE" and data.get("msgId"):
+                    mid = data.get("msgId")
+                    purged = (manager.purge_queued(target_id, lambda f: f.get("msgId") == mid)
+                              + manager.purge_queued(client_id, lambda f: f.get("msgId") == mid))
+                    if purged:
+                        print(f"relay: purged {purged} queued frame(s) of deleted msg {mid[:8]}")
+
+                # CHAT_CLEAR = the sender wiped their side of this 1:1 chat: the receiver drops the
+                # sender's messages (purge exactly those from their queues) and the sender's own
+                # sibling devices wipe the WHOLE conversation (purge both directions there).
+                if msg_type == "CHAT_CLEAR":
+                    pair = {client_id, target_id}
+                    purged = (manager.purge_queued(
+                                  target_id,
+                                  lambda f: f.get("sender") == client_id and not f.get("groupId"))
+                              + manager.purge_queued(
+                                  client_id,
+                                  lambda f: {f.get("sender"), f.get("target")} == pair
+                                            and not f.get("groupId")))
+                    if purged:
+                        print(f"relay: purged {purged} queued frame(s) after CHAT_CLEAR")
 
                 # Cache live-location position (delivered or not) so a reconnecting receiver gets the
                 # latest pin; clear it when the share stops.
