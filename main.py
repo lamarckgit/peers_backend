@@ -18,6 +18,7 @@ from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from functions import response_module
 from functions import attest_module # Not from functions.response_module import * because duplicate method name conflicts
+from functions import demo_bot       # App Store review demo contact — isolated; see functions/demo_bot.py
 #from constants import Constants
 from fastapi import FastAPI, Request, HTTPException, Depends, status, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -890,6 +891,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 data["senderDevice"] = device
                 msg_type = data.get("type")
                 print(f"relay {client_id} → {target_id}: {msg_type}")
+
+                # --- App Store review demo contact ------------------------------------------------
+                # Fully isolated: fires ONLY when the target is the single reserved demo peer, so every
+                # real peer falls straight through to the normal path below, unchanged. See
+                # functions/demo_bot.py (kill switch: env PEERS_DEMO_BOT_ENABLED=0).
+                if demo_bot.is_demo_target(target_id):
+                    try:
+                        await demo_bot.handle_frame(manager, database,
+                                                    sender_id=client_id, sender_device=device, data=data)
+                    except Exception as e:
+                        print(f"demo_bot hook error: {e}")
+                    continue
+                # ----------------------------------------------------------------------------------
 
                 # Physical-proximity memory for nearby_wake (see record_proximity).
                 if msg_type == "PEER_NEARBY":
