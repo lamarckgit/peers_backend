@@ -52,6 +52,43 @@ snapshot_cleanup_thread = None
 # Ensure the directories exists
 PROFILE_DIR = "static/profile_images"
 os.makedirs(PROFILE_DIR, exist_ok=True)
+# Downscaled-avatar cache for LIST payloads (/v1/friends/, /v1/group_members/): uploaded profile
+# images run 100-500KB each, so a friends refresh shipped megabytes of base64 — the dominant cost
+# of a "slow refresh" on a weak connection. Thumbs are created lazily next to the original
+# (peer_<uuid>_thumb.jpg) and regenerated whenever the original is newer, so the image-update
+# endpoints need no changes. The max side must stay large enough for the profile dialog's
+# tap-to-full-screen view, which reuses the list image on all clients.
+THUMB_MAX_SIDE = int(os.environ.get("PEERS_THUMB_MAX_SIDE", "800"))
+THUMB_QUALITY = int(os.environ.get("PEERS_THUMB_QUALITY", "78"))
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
+    logging.warning("Pillow not installed — list payloads ship full-size avatars (pip install Pillow)")
+
+def profile_image_b64(file_path: str, thumbnail: bool = False):
+    """Base64 of a profile image, or None if the file doesn't exist. thumbnail=True serves the
+    cached downscaled JPEG copy instead; any failure (Pillow missing, undecodable image) falls
+    back to the full-size file so the payload is never broken, just bigger."""
+    if not os.path.exists(file_path):
+        return None
+    if thumbnail and PILImage is not None:
+        thumb_path = f"{os.path.splitext(file_path)[0]}_thumb.jpg"
+        try:
+            if (not os.path.exists(thumb_path)
+                    or os.path.getmtime(thumb_path) < os.path.getmtime(file_path)):
+                with PILImage.open(file_path) as img:
+                    img = img.convert("RGB")
+                    img.thumbnail((THUMB_MAX_SIDE, THUMB_MAX_SIDE))
+                    img.save(thumb_path, "JPEG", quality=THUMB_QUALITY)
+            # Serve the thumb only if it actually is smaller — a small, heavily-compressed
+            # original can come out LARGER re-encoded.
+            if os.path.getsize(thumb_path) < os.path.getsize(file_path):
+                file_path = thumb_path
+        except Exception as e:
+            logging.warning(f"thumbnail failed for {file_path}: {e}")
+    with open(file_path, "rb") as fh:
+        return base64.b64encode(fh.read()).decode("ascii")
 SNAPSHOT_DIR = "static/snapshots"
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 # Additional "about me" profile images: stored as <uuid>-<seq>.jpg; their display order + the in-use
@@ -1839,13 +1876,14 @@ async def create_peer(params: RequestCreatePeer, db: Session = Depends(get_db)):
 async def delete_peer(params: RequestUuid, db: Session = Depends(get_db)):
     try:
         result = response_module.delete_peer(db, params.uuid)
-        # Remove the profile image (peer_{uuid_hex}.jpg) if present.
-        file_path = os.path.join(PROFILE_DIR, f"peer_{params.uuid}.jpg")
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except OSError as e:
-                print(f"delete_peer: failed to remove image {file_path}: {e}")
+        # Remove the profile image (peer_{uuid_hex}.jpg) + its cached list thumbnail if present.
+        for suffix in (".jpg", "_thumb.jpg"):
+            file_path = os.path.join(PROFILE_DIR, f"peer_{params.uuid}{suffix}")
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError as e:
+                    print(f"delete_peer: failed to remove image {file_path}: {e}")
         # Remove ALL additional "about me" items — extra photos AND the profile video (+ its poster), stored
         # as <uuid>-<seq>.jpg / <uuid>-<seq>.mp4. (uuids are fixed 32-hex, so the "<uuid>-" prefix is exact.)
         if _is_hex32(params.uuid):
@@ -2180,10 +2218,10 @@ async def group_members(params: RequestGroupMember, db: Session = Depends(get_db
     try:
         members = response_module.group_members(db, params.group_id)
         for m in members:
-            file_path = os.path.join(PROFILE_DIR, f"peer_{m['uuid']}.jpg")
-            if os.path.exists(file_path):
-                with open(file_path, "rb") as fh:
-                    m["image_data"] = base64.b64encode(fh.read()).decode("ascii")
+            image = profile_image_b64(os.path.join(PROFILE_DIR, f"peer_{m['uuid']}.jpg"),
+                                      thumbnail=True)
+            if image:
+                m["image_data"] = image
         return {"members": members}
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
@@ -2453,10 +2491,10 @@ async def get_friends(params: RequestId, db: Session = Depends(get_db)):
     try:
         friends = response_module.get_friends(db, params.uuid)
         for f in friends:
-            file_path = os.path.join(PROFILE_DIR, f"peer_{f['uuid']}.jpg")
-            if os.path.exists(file_path):
-                with open(file_path, "rb") as fh:
-                    f["image_data"] = base64.b64encode(fh.read()).decode("ascii")
+            image = profile_image_b64(os.path.join(PROFILE_DIR, f"peer_{f['uuid']}.jpg"),
+                                      thumbnail=True)
+            if image:
+                f["image_data"] = image
         return {"friends": friends}
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
