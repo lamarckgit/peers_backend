@@ -7,7 +7,7 @@ from functions import crypt_module
 from helpers.email_templates import *
 #from constants import Constants
 
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 import random
@@ -1559,6 +1559,10 @@ def report_peer(db: Session, reporter_hex: str, reported_hex: str, reason: str):
     # a fire-and-forget daemon thread — it must never block the event loop or fail the report.
     alert_to = os.environ.get("PEERS_REPORT_EMAIL", "development@safexs.eu")
     if alert_to:
+        now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone()   # server's local timezone
+        report_time = (f"{now_local.strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                       f"(UTC {now_utc.strftime('%H:%M:%S')})")
         names = {}
         for label, uuid_bytes in (("reporter", reporter), ("reported", reported)):
             row = db.execute(text("SELECT name FROM user WHERE uuid = :uuid"),
@@ -1568,7 +1572,7 @@ def report_peer(db: Session, reporter_hex: str, reported_hex: str, reason: str):
         def _send():
             try:
                 send_report_alert_email(alert_to, names["reporter"], reporter_hex,
-                                        names["reported"], reported_hex, why)
+                                        names["reported"], reported_hex, why, report_time)
             except Exception as e:
                 print(f"report: alert email failed: {e}")
         threading.Thread(target=_send, daemon=True).start()

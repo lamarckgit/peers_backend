@@ -290,11 +290,13 @@ def send_new_user_email(to_email: str, from_email: str, password: str, dear_text
 # App Store Guideline 1.2 commits us to acting on reports within 24 hours — this mail is what
 # makes that deadline visible without polling the table.
 def send_report_alert_email(to_email: str, reporter_name: str, reporter_hex: str,
-                            reported_name: str, reported_hex: str, reason: str):
+                            reported_name: str, reported_hex: str, reason: str,
+                            report_time: str):
     html_template = """
     <p class="header">PeersClub user report</p>
     <p class="body"><b>{reported_name}</b> ({reported_hex}) was reported.</p>
     <ul>
+        <li>report time: {report_time}</li>
         <li>reason: <span class="highlight">{reason}</span></li>
         <li>reported by: {reporter_name} ({reporter_hex})</li>
     </ul>
@@ -307,6 +309,7 @@ def send_report_alert_email(to_email: str, reporter_name: str, reporter_hex: str
 
     {reported_name} ({reported_hex}) was reported.
 
+    - report time: {report_time}
     - reason: {reason}
     - reported by: {reporter_name} ({reporter_hex})
 
@@ -320,6 +323,7 @@ def send_report_alert_email(to_email: str, reporter_name: str, reporter_hex: str
         "reporter_name": reporter_name,
         "reporter_hex": reporter_hex,
         "reason": reason,
+        "report_time": report_time,
     }
 
     EmailSender.send_email(
