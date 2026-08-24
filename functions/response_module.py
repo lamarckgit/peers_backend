@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 import string
+import threading
 import time
 import os
 import httpx
@@ -1553,6 +1554,24 @@ def report_peer(db: Session, reporter_hex: str, reported_hex: str, reason: str):
     )
     db.commit()
     print(f"report: {reporter_hex[:8]} reported {reported_hex[:8]} — {why}")
+    # Alert the moderator by email so the 24h action window (guideline 1.2) starts ticking visibly.
+    # Names are resolved HERE (the db session must not cross into the thread); the SMTP send runs in
+    # a fire-and-forget daemon thread — it must never block the event loop or fail the report.
+    alert_to = os.environ.get("PEERS_REPORT_EMAIL", "development@safexs.eu")
+    if alert_to:
+        names = {}
+        for label, uuid_bytes in (("reporter", reporter), ("reported", reported)):
+            row = db.execute(text("SELECT name FROM user WHERE uuid = :uuid"),
+                             {"uuid": uuid_bytes}).mappings().fetchone()
+            names[label] = (row["name"] if row and row["name"] else "(unknown)")
+
+        def _send():
+            try:
+                send_report_alert_email(alert_to, names["reporter"], reporter_hex,
+                                        names["reported"], reported_hex, why)
+            except Exception as e:
+                print(f"report: alert email failed: {e}")
+        threading.Thread(target=_send, daemon=True).start()
     return ResponseResult(success=True, error="")
 
 def create_poll(db: Session, admin_hex: str, question: str, multiple_answers: bool, options,

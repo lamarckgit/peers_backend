@@ -285,3 +285,47 @@ def send_new_user_email(to_email: str, from_email: str, password: str, dear_text
         plain_template=plain_template,
         params=params
     )
+
+# PeersClub: alert the moderator that a user report landed in the user_report table.
+# App Store Guideline 1.2 commits us to acting on reports within 24 hours — this mail is what
+# makes that deadline visible without polling the table.
+def send_report_alert_email(to_email: str, reporter_name: str, reporter_hex: str,
+                            reported_name: str, reported_hex: str, reason: str):
+    html_template = """
+    <p class="header">PeersClub user report</p>
+    <p class="body"><b>{reported_name}</b> ({reported_hex}) was reported.</p>
+    <ul>
+        <li>reason: <span class="highlight">{reason}</span></li>
+        <li>reported by: {reporter_name} ({reporter_hex})</li>
+    </ul>
+    <p class="body">Review the user_report table and act within 24 hours
+    (remove content / block or delete the user if warranted).</p>
+    """
+
+    plain_template = """
+    PeersClub user report
+
+    {reported_name} ({reported_hex}) was reported.
+
+    - reason: {reason}
+    - reported by: {reporter_name} ({reporter_hex})
+
+    Review the user_report table and act within 24 hours
+    (remove content / block or delete the user if warranted).
+    """
+
+    params = {
+        "reported_name": reported_name,
+        "reported_hex": reported_hex,
+        "reporter_name": reporter_name,
+        "reporter_hex": reporter_hex,
+        "reason": reason,
+    }
+
+    EmailSender.send_email(
+        to_email=to_email,
+        subject=f"PeersClub report: {reported_name} — {reason}",
+        html_template=html_template,
+        plain_template=plain_template,
+        params=params
+    )
