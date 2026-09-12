@@ -58,6 +58,7 @@ class ResponsePeer(BaseModel):
     about_me: str
     peer_name: str = ""        # 6-char public peer code shown under the profile picture
     image_data: str = None
+    e2ee_pub: str = ""         # base64 X25519 public key for E2EE chat ("" = peer has none yet)
     error: str
 
 class ResponseBLE(BaseModel):
@@ -583,7 +584,7 @@ def get_peer(db: Session, peer_hex: str):
             raise Exception("Invalid peer uuid")
 
         select_query = text("""
-        SELECT name, about_me, peer_name FROM user WHERE uuid = :uuid
+        SELECT name, about_me, peer_name, e2ee_pub FROM user WHERE uuid = :uuid
         """)
         row = db.execute(select_query, {"uuid": peer_uuid}).mappings().fetchone()
         if not row:
@@ -604,6 +605,7 @@ def get_peer(db: Session, peer_hex: str):
             name=row["name"] or "",
             about_me=row["about_me"] or "",
             peer_name=peer_code,
+            e2ee_pub=row["e2ee_pub"] or "",
             error="",
         )
 
@@ -667,6 +669,41 @@ def register_peer_token(db: Session, peer_hex: str, token: str):
         db.commit()
         if result.rowcount == 0:
             raise Exception("Peer not found")
+        return ResponseResult(success=True, error="")
+
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+def set_e2ee_key(db: Session, peer_hex: str, pub: str):
+    """Stores a peer's X25519 PUBLIC key (user.e2ee_pub) for end-to-end encrypted 1:1 chat.
+    The server never holds private keys. Prerequisite DDL:
+      ALTER TABLE user ADD e2ee_pub VARCHAR(64) DEFAULT NULL;
+    Same X-API-Key / uuid-hex-keyed pattern as register_peer_token."""
+    try:
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except ValueError:
+            raise Exception("Invalid peer uuid")
+        if len(peer_uuid) != 16:
+            raise Exception("Invalid peer uuid")
+        # A base64 X25519 public key is exactly 32 bytes; reject anything else so a client bug
+        # can't park an undecodable key that silently breaks its chats.
+        try:
+            if len(_b64.b64decode(pub, validate=True)) != 32:
+                raise ValueError
+        except Exception:
+            raise Exception("Invalid e2ee public key")
+
+        result = db.execute(
+            text("UPDATE user SET e2ee_pub = :pub WHERE uuid = :uuid"),
+            {"pub": pub, "uuid": peer_uuid},
+        )
+        db.commit()
+        if result.rowcount == 0:
+            raise Exception("Peer not found")
+        print(f"e2ee: key registered for {peer_hex[:8]}")
         return ResponseResult(success=True, error="")
 
     except SQLAlchemyError as e:
@@ -813,7 +850,7 @@ def send_silent_wake(target_token: str) -> bool:
 
 def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str, text: str, badge: int,
                            msg_id: str = "", video_id: str = "", kind_label: str = "",
-                           quoted_text: str = "", quoted_author: str = "") -> bool:
+                           quoted_text: str = "", quoted_author: str = "", e2ee: bool = False) -> bool:
     """Visible 'new message' push for a FRIEND's chat message to an offline/backgrounded peer:
       • aps.alert (title = sender name, body = the message text) → a real banner on the lock screen
         / a notification while the receiver is in another app,
@@ -831,15 +868,27 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
     if not target_token:
         return False
     name = sender_name or "A peer"
-    body = text or kind_label or "New message"
-    data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
-            "text": text or "", "msg_id": msg_id or "", "video_id": video_id or ""}
-    # A Reply's quote rides along (text + author only — small enough for the push size budget; a
-    # quoted IMAGE stays out and is delivered by the reconnect catch-up flush). The app stores these
-    # so a killed-app receiver shows the reply's quote immediately, not just on reconnect.
-    if quoted_text or quoted_author:
-        data["quoted_text"] = (quoted_text or "")[:280]
-        data["quoted_author"] = (quoted_author or "")[:80]
+    if e2ee:
+        # END-TO-END ENCRYPTED frame: `text` is ciphertext the server cannot read. The banner shows a
+        # neutral body (iOS renders aps.alert verbatim; Android composes its banner client-side after
+        # decrypting). The ciphertext rides in data.text when it fits the FCM 4KB budget so the app
+        # can store the message immediately; a long one arrives via the reconnect catch-up queue
+        # instead (E2EE frames are always queued). The quote is NEVER truncated here — a sliced
+        # ciphertext would be undecodable — it too arrives via the queue.
+        body = kind_label or "New message"
+        data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
+                "text": (text or "") if len(text or "") <= 2800 else "",
+                "msg_id": msg_id or "", "video_id": video_id or "", "e2ee": "1"}
+    else:
+        body = text or kind_label or "New message"
+        data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
+                "text": text or "", "msg_id": msg_id or "", "video_id": video_id or ""}
+        # A Reply's quote rides along (text + author only — small enough for the push size budget; a
+        # quoted IMAGE stays out and is delivered by the reconnect catch-up flush). The app stores these
+        # so a killed-app receiver shows the reply's quote immediately, not just on reconnect.
+        if quoted_text or quoted_author:
+            data["quoted_text"] = (quoted_text or "")[:280]
+            data["quoted_author"] = (quoted_author or "")[:80]
     aps_object = messaging.Aps(
         alert=messaging.ApsAlert(title=name, body=body),
         sound="default",
@@ -1330,12 +1379,12 @@ def get_friends(db: Session, user_hex: str):
     rows = db.execute(
         text("""
         SELECT u.uuid AS fuid, COALESCE(NULLIF(uu.uuid_2_name, ''), u.name) AS name,
-               u.name AS account_name, u.about_me AS about_me
+               u.name AS account_name, u.about_me AS about_me, u.e2ee_pub AS e2ee_pub
         FROM user_user uu JOIN user u ON u.uuid = uu.uuid_2
         WHERE uu.uuid_1 = :me AND uu.is_active = 1
         UNION
         SELECT u.uuid AS fuid, COALESCE(NULLIF(uu.uuid_1_name, ''), u.name) AS name,
-               u.name AS account_name, u.about_me AS about_me
+               u.name AS account_name, u.about_me AS about_me, u.e2ee_pub AS e2ee_pub
         FROM user_user uu JOIN user u ON u.uuid = uu.uuid_1
         WHERE uu.uuid_2 = :me AND uu.is_active = 1
         """),
@@ -1344,7 +1393,8 @@ def get_friends(db: Session, user_hex: str):
 
     return [
         {"uuid": r["fuid"].hex(), "name": r["name"] or "",
-         "account_name": r["account_name"] or "", "about_me": r["about_me"] or ""}
+         "account_name": r["account_name"] or "", "about_me": r["about_me"] or "",
+         "e2ee_pub": r["e2ee_pub"] or ""}
         for r in rows
     ]
 

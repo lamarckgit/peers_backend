@@ -1004,11 +1004,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # leave a stale socket that accepts the write, so "delivered" isn't reliable). The
                 # receiver de-dups by msgId (and UPGRADES a quote-less push placeholder), so an online
                 # receiver that already got it ignores the flush. The queue is byte-bounded.
+                # E2EE frames (data["e2ee"]) always queue too: their push may omit the ciphertext
+                # (size budget), so the queued frame is the guaranteed delivery path.
                 if (msg_type == "CHAT_MESSAGE" and not data.get("liveUntil")
                         and (data.get("contactCard") or data.get("imageData") or data.get("audioData")
                              or data.get("videoId") or data.get("docId") or data.get("pollId")
                              or data.get("latitude") is not None
-                             or data.get("quotedText") or data.get("quotedAuthorName"))):
+                             or data.get("quotedText") or data.get("quotedAuthorName")
+                             or data.get("e2ee"))):
                     try:
                         s_q = database.create_session()
                         try:
@@ -1084,7 +1087,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                             data.get("text") or "", badge, data.get("msgId") or "",
                                             video_id=data.get("videoId") or "", kind_label=kind_label,
                                             quoted_text=data.get("quotedText") or "",
-                                            quoted_author=data.get("quotedAuthorName") or "")
+                                            quoted_author=data.get("quotedAuthorName") or "",
+                                            e2ee=bool(data.get("e2ee")))
                                         print(f"relay: chat-msg push to {target_id[:8]} sent={ok} badge={badge}")
                                     else:
                                         print(f"relay: offline friend {target_id[:8]} has no push token")
@@ -1444,6 +1448,10 @@ class RequestStoreFCMToken(BaseModel):
 class RequestStoreVoipToken(BaseModel):
     uuid: str
     voip_token: str
+
+class RequestSetE2eeKey(BaseModel):
+    uuid: str
+    e2ee_pub: str          # base64 X25519 public key (32 bytes → 44 chars)
 
 class RequestLogOnline(BaseModel):
     uuid: str
@@ -2016,6 +2024,19 @@ async def register_peer_token(params: RequestStoreFCMToken, db: Session = Depend
 async def register_peer_voip_token(params: RequestStoreVoipToken, db: Session = Depends(get_db)):
     try:
         return response_module.register_peer_voip_token(db, params.uuid, params.voip_token)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Stores a peer's X25519 public key for end-to-end encrypted 1:1 chat. The server only ever holds
+# PUBLIC keys — private keys never leave the clients' keychains. A registered key doubles as the
+# capability signal: senders encrypt only to peers that have one (older app versions never register,
+# so they keep receiving plaintext). Same X-API-Key + uuid-hex-keyed pattern as register_peer_token.
+@app.post("/v1/set_e2ee_key/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def set_e2ee_key(params: RequestSetE2eeKey, db: Session = Depends(get_db)):
+    try:
+        return response_module.set_e2ee_key(db, params.uuid, params.e2ee_pub)
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:
