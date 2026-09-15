@@ -8,6 +8,7 @@ import json
 import os
 import ssl
 import threading
+import re
 import time
 import uuid
 
@@ -1453,6 +1454,14 @@ class RequestSetE2eeKey(BaseModel):
     uuid: str
     e2ee_pub: str          # base64 X25519 public key (32 bytes → 44 chars)
 
+class RequestLinkDevice(BaseModel):
+    uuid: str              # the PHONE's peer uuid (authenticated by check_peer_uuid)
+    code: str              # one-time link code shown in the desktop's QR (10 chars, A-Z2-9)
+    blob: str              # base64(phonePub32 ‖ nonce12 ‖ AES-GCM ct) — identity bundle sealed to the desktop's ephemeral key
+
+class RequestLinkDeviceTake(BaseModel):
+    code: str
+
 class RequestLogOnline(BaseModel):
     uuid: str
     ble_id: str
@@ -2041,6 +2050,49 @@ async def set_e2ee_key(params: RequestSetE2eeKey, db: Session = Depends(get_db))
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# DEVICE LINK (desktop apps): the phone hands its identity to a desktop that has no iCloud Keychain
+# (Windows). The desktop shows a QR = one-time code + an EPHEMERAL X25519 public key; the phone seals
+# {peerId, name, peerCode, e2eePriv} to that key and deposits the ciphertext here under the code; the
+# desktop collects it ONCE within 5 minutes and decrypts locally. The server only ever relays
+# ciphertext it cannot read (no key material at rest); a code is single-use and dies with the TTL.
+_DEVICE_LINK_TTL_S = 300
+_DEVICE_LINK_CODE = re.compile(r"^[A-Z2-9]{10}$")
+_device_links: Dict[str, dict] = {}          # code → {"uuid", "blob", "ts"}
+_device_links_lock = threading.Lock()
+
+def _device_links_sweep():
+    now = time.time()
+    for k in [k for k, v in _device_links.items() if now - v["ts"] > _DEVICE_LINK_TTL_S]:
+        _device_links.pop(k, None)
+
+@app.post("/v1/link_device/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def link_device(params: RequestLinkDevice):
+    code = params.code.strip().upper()
+    if not _DEVICE_LINK_CODE.match(code):
+        return JSONResponse(content={"success": False, "error": "Invalid link code"}, status_code=400)
+    if not params.blob or len(params.blob) > 16384:
+        return JSONResponse(content={"success": False, "error": "Invalid blob"}, status_code=400)
+    try:
+        base64.b64decode(params.blob, validate=True)
+    except Exception:
+        return JSONResponse(content={"success": False, "error": "Invalid blob"}, status_code=400)
+    with _device_links_lock:
+        _device_links_sweep()
+        _device_links[code] = {"uuid": params.uuid, "blob": params.blob, "ts": time.time()}
+    return {"success": True}
+
+@app.post("/v1/link_device_take/", dependencies=[Depends(verify_api_key)])
+async def link_device_take(params: RequestLinkDeviceTake):
+    code = params.code.strip().upper()
+    if not _DEVICE_LINK_CODE.match(code):
+        return JSONResponse(content={"success": False, "error": "Invalid link code"}, status_code=400)
+    with _device_links_lock:
+        _device_links_sweep()
+        entry = _device_links.pop(code, None)      # single use
+    if entry is None:
+        return {"success": False, "pending": True}
+    return {"success": True, "uuid": entry["uuid"], "blob": entry["blob"]}
 
 # Presence: returns which of the supplied peer uuids are "reachable & available" — i.e. they have
 # a live signaling socket (active_connections) AND are active (is_active = 1). The app uses this to
