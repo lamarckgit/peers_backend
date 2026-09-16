@@ -7,7 +7,7 @@ class EmailSender:
     SMTP_SERVER = "smtp.titan.email"
     SMTP_PORT = 587
     SMTP_USER = "admin@safexs.eu"
-    SMTP_PASSWORD = "dyrkif-qAjfaw-9zojju"
+    SMTP_PASSWORD = "jomxej-bazzo5-jikMuz"
 
     # Static CSS styling
     CSS_STYLE = """
