@@ -470,7 +470,9 @@ def verify_human_challenge(challenge_id: str, answer: int) -> bool:
 def generate_peer_code(db: Session) -> str:
     for _ in range(25):
         code = "".join(secrets.choice(_PEER_CODE_ALPHABET) for _ in range(6))
-        if not db.execute(text("SELECT 1 FROM user WHERE peer_name = :c"), {"c": code}).fetchone():
+        # BINARY: codes are mixed-case (the alphabet has a-z AND A-Z) and matched case-sensitively; the
+        # column's collation alone would treat "abc123" and "ABC123" as the same code.
+        if not db.execute(text("SELECT 1 FROM user WHERE BINARY peer_name = :c"), {"c": code}).fetchone():
             return code
     raise Exception("Could not allocate a unique peer code")
 
@@ -616,12 +618,13 @@ def get_peer(db: Session, peer_hex: str):
 
 def find_peer_by_code(db: Session, code: str):
     """Resolve a 6-char public peer code (peer_name) to {uuid (hex), name}, used when a peer types a code
-    to send a friend request. Returns None when no peer has that code."""
+    to send a friend request. CASE-SENSITIVE (BINARY): "abc123" and "ABC123" are different codes.
+    Returns None when no peer has that code."""
     code = (code or "").strip()
     if not code:
         return None
     row = db.execute(
-        text("SELECT uuid, name FROM user WHERE peer_name = :c"),
+        text("SELECT uuid, name FROM user WHERE BINARY peer_name = :c"),
         {"c": code},
     ).mappings().fetchone()
     if not row:

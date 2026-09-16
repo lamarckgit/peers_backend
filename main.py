@@ -2610,10 +2610,43 @@ class RequestPeerByCode(BaseModel):
     code: str
     caller_uuid: str
 
+# Peer-code guessing guard: a caller gets 3 INVALID lookups (no peer has that code) per rolling hour;
+# a VALID lookup resets the count. In-memory per caller uuid (single-worker backend), swept lazily.
+_CODE_ATTEMPT_LIMIT = 3
+_CODE_ATTEMPT_WINDOW_S = 3600
+_code_attempts: Dict[str, list] = {}          # caller uuid → timestamps of invalid lookups
+_code_attempts_lock = threading.Lock()
+
+def _code_attempts_blocked(caller: str) -> int:
+    """Seconds until the caller may try again, or 0 when under the limit."""
+    now = time.time()
+    with _code_attempts_lock:
+        for k in [k for k, v in _code_attempts.items() if not v or now - v[-1] > _CODE_ATTEMPT_WINDOW_S]:
+            _code_attempts.pop(k, None)
+        hits = [t for t in _code_attempts.get(caller, []) if now - t <= _CODE_ATTEMPT_WINDOW_S]
+        _code_attempts[caller] = hits
+        if len(hits) >= _CODE_ATTEMPT_LIMIT:
+            return int(_CODE_ATTEMPT_WINDOW_S - (now - hits[0])) + 1
+        return 0
+
+def _code_attempts_record(caller: str, valid: bool):
+    with _code_attempts_lock:
+        if valid:
+            _code_attempts.pop(caller, None)
+        else:
+            _code_attempts.setdefault(caller, []).append(time.time())
+
 @app.post("/v1/peer_by_code/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
 async def peer_by_code(params: RequestPeerByCode, db: Session = Depends(get_db)):
     try:
+        wait = _code_attempts_blocked(params.caller_uuid)
+        if wait > 0:
+            mins = max(1, (wait + 59) // 60)
+            return JSONResponse(content={"success": False,
+                                         "error": f"Too many invalid Peer Codes — try again in {mins} minute{'s' if mins != 1 else ''}"},
+                                status_code=status.HTTP_429_TOO_MANY_REQUESTS)
         match = response_module.find_peer_by_code(db, params.code)
+        _code_attempts_record(params.caller_uuid, valid=bool(match))
         if not match:
             return JSONResponse(content={"success": False, "error": "No peer with that code"},
                                 status_code=status.HTTP_404_NOT_FOUND)
