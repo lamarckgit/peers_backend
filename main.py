@@ -2648,7 +2648,7 @@ async def peer_by_code(params: RequestPeerByCode, db: Session = Depends(get_db))
         match = response_module.find_peer_by_code(db, params.code)
         _code_attempts_record(params.caller_uuid, valid=bool(match))
         if not match:
-            return JSONResponse(content={"success": False, "error": "No peer with that code"},
+            return JSONResponse(content={"success": False, "error": "The Friend request cannot be made"},
                                 status_code=status.HTTP_404_NOT_FOUND)
         return {"success": True, "uuid": match["uuid"], "name": match["name"]}
     except HTTPException as e:
