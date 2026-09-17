@@ -965,7 +965,8 @@ def send_group_call_push(target_token: str, sender_hex: str, sender_name: str, g
     title = group_name or "Group call"
     body = f"{name} is starting a group {'video' if video else 'audio'} call"
     data = {"action": "GROUP_CALL_REQUEST", "sender_id": sender_hex, "sender_name": name,
-            "group_id": str(group_id), "group_name": group_name or "", "video": "1" if video else "0"}
+            "group_id": str(group_id), "group_name": group_name or "", "video": "1" if video else "0",
+            "ts": str(int(time.time()))}   # lets a cold-launched app drop a stale (missed) ring
     aps_object = messaging.Aps(
         alert=messaging.ApsAlert(title=title, body=body),
         sound="default",
