@@ -2618,8 +2618,7 @@ class RequestPeerByCode(BaseModel):
 # a user to a place is ever stored or logged; only the aggregate goes to location.live_occupancy
 # (throttled). Counts below the floor are reported as 0 so a near-empty venue doesn't reveal who is there.
 _LOC_PRESENCE_WINDOW_S = 600        # a sighting counts for 10 minutes
-_LOC_OCCUPANCY_FLOOR = 3            # API shows 0 below this many people (k-anonymity for small venues)
-_LOC_SHOW_PRESENCE_BELOW_FLOOR = True   # below the floor: still flag "someone is here" (lowest heat band); False = fully hidden
+_LOC_OCCUPANCY_FLOOR = 2            # API shows 0 below this many people (k-anonymity for small venues)
 _LOC_PERSIST_MIN_S = 60             # write live_occupancy at most once a minute per location
 _LOC_CACHE_S = 60                   # location list cache (beacon lookup on every heartbeat)
 _loc_presence: Dict[int, Dict[str, float]] = {}
@@ -2675,11 +2674,7 @@ async def locations(params: RequestLocations, db: Session = Depends(get_db)):
         for r in rows:
             with _loc_lock:
                 n = _loc_count(r["id"], now)
-            # Below the floor the exact number stays hidden, but the map may still light the venue in
-            # its LOWEST heat band ("1–2 Peers" in the app's legend — the same granularity the legend
-            # already promises): `present` says someone is there, never how many or who.
-            out.append({**r, "occupancy": n if n >= _LOC_OCCUPANCY_FLOOR else 0,
-                        "present": n >= 1 and _LOC_SHOW_PRESENCE_BELOW_FLOOR})
+            out.append({**r, "occupancy": n if n >= _LOC_OCCUPANCY_FLOOR else 0})
             _loc_persist(db, r["id"], n, now)
         return {"success": True, "namespace": "688b1b799455d5376505", "window_s": _LOC_PRESENCE_WINDOW_S,
                 "floor": _LOC_OCCUPANCY_FLOOR, "locations": out}

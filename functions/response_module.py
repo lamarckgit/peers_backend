@@ -1912,7 +1912,10 @@ def closed_peer_set(db: Session, peer_hexes):
 # PEERS.CLUB namespace (first 10 bytes of SHA-1("peers.club") = 688b1b799455d5376505) + a 6-byte
 # instance per location. beacon_id = namespace + instance as 32 lowercase hex chars. Apps that see the
 # beacon send presence heartbeats; occupancy is counted IN MEMORY (main.py) — no row ever links a user
-# to a place. Only the aggregate lands here. min_rssi lets a venue ignore far-away sightings
+# to a place. Only the aggregate lands here. min_rssi lets a venue ignore far-away sightings.
+# location.name may be NULL: the app lays a location over the map venue (MapKit bar/club) within
+# ~40 m of its coordinates — that venue gets the occupancy heat, and only a non-NULL name replaces
+# the venue's own label (list_locations returns '' for NULL).
 # Example row (category_id defaults to 0 = 'general venue'):
 #   INSERT INTO location (name, beacon_id, latitude, longitude, min_rssi)
 #   VALUES ('Café De Test', '688b1b799455d5376505000000000001', 52.3702, 4.8952, -90);
