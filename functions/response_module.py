@@ -7,7 +7,7 @@ from functions import crypt_module
 from helpers.email_templates import *
 #from constants import Constants
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 import random
@@ -1920,6 +1920,101 @@ def closed_peer_set(db: Session, peer_hexes):
 #   INSERT INTO location (name, beacon_id, latitude, longitude, min_rssi)
 #   VALUES ('Café De Test', '688b1b799455d5376505000000000001', 52.3702, 4.8952, -90);
 
+# location_offer: a venue's promotion, shown on the live heat map like the simulation's "Today Happy
+# Hour": the venue's label turns orange and a tap opens the offer (title, validity, text). Only rows
+# with is_active = 1 are served. Two independent pairs, all four optional — ALL FOUR STORED IN UTC:
+#   valid_from / valid_to  (DATETIME, UTC) — WHETHER the offer shows: only while now lies inside them
+#                                       (NULL = open on that side). Sent as UTC instants ("…Z"), so the
+#                                       check is the same on every phone, whatever its own timezone.
+#   start_time / end_time  (TIME, UTC) — the WORDING only: "between a-b", "from a", "until b", or
+#                                       "any time" when both are NULL. Sent converted to the
+#                                       LOCATION's timezone (derived from its coordinates), HH:mm 24-hour.
+# The location's timezone comes from its latitude/longitude via the `timezonefinder` package
+# (pip install timezonefinder — listed in requirements.txt). Without it the times fall back to UTC and
+# are sent with a " UTC" suffix, so a missing install is visible instead of silently wrong.
+#   -- A happy hour in Amsterdam (CEST = UTC+2) on 20 Sep 2026, 15:00-20:00 local, shown that whole local day:
+#   INSERT INTO location_offer (location_id, valid_from, valid_to, start_time, end_time, offer_title, offer_text)
+#   VALUES (1, '2026-09-19 22:00:00', '2026-09-20 21:59:59', '13:00', '18:00', 'Today Happy Hour', '2 for 1');
+#   -- MySQL can convert for you when its timezone tables are loaded:
+#   --   CONVERT_TZ('2026-09-20 15:00:00', 'Europe/Amsterdam', 'UTC')
+
+_tz_finder = None
+_tz_finder_missing = False
+_tz_cache = {}
+
+def location_timezone(latitude: float, longitude: float) -> str:
+    """IANA timezone of a coordinate (e.g. 'Europe/Amsterdam'), cached — a location never moves.
+    Needs the `timezonefinder` package; without it (or over open sea) → 'UTC'."""
+    global _tz_finder, _tz_finder_missing
+    key = (round(latitude, 3), round(longitude, 3))
+    if key in _tz_cache:
+        return _tz_cache[key]
+    name = "UTC"
+    if not _tz_finder_missing:
+        try:
+            if _tz_finder is None:
+                from timezonefinder import TimezoneFinder
+                _tz_finder = TimezoneFinder()
+            name = _tz_finder.timezone_at(lat=latitude, lng=longitude) or "UTC"
+        except ImportError:
+            _tz_finder_missing = True
+            print("location offers: `timezonefinder` is not installed — offer times are sent in UTC. "
+                  "Run: pip install timezonefinder")
+        except Exception as e:
+            print(f"location offers: timezone lookup failed for {key}: {e}")
+    _tz_cache[key] = name
+    return name
+
+def _offer_moment(value):
+    """UTC DATETIME → 'YYYY-MM-DDTHH:MM:SSZ' (an instant the app compares with its own UTC now);
+    NULL → None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+    return None
+
+def _offer_clock(value, tz_name: str):
+    """UTC TIME (timedelta or 'HH:MM[:SS]' text) → 'HH:MM' (24-hour) in the LOCATION's timezone, using
+    today's date so daylight saving is right; ' UTC' is appended when the zone is unknown. NULL → None."""
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        total = int(value.total_seconds()) % 86400
+    else:
+        text_value = str(value).strip()
+        if len(text_value) < 5 or text_value[2] != ":":
+            return None
+        try:
+            total = int(text_value[:2]) * 3600 + int(text_value[3:5]) * 60
+        except ValueError:
+            return None
+    utc_moment = datetime.now(timezone.utc).replace(hour=total // 3600, minute=(total % 3600) // 60,
+                                                    second=0, microsecond=0)
+    if tz_name and tz_name != "UTC":
+        try:
+            from zoneinfo import ZoneInfo
+            return utc_moment.astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
+        except Exception as e:
+            print(f"location offers: cannot convert to {tz_name}: {e}")
+    return utc_moment.strftime("%H:%M") + " UTC"
+
+def list_location_offers(db: Session):
+    """location_id → its ACTIVE offers as RAW rows (earliest first; open-ended ones last). A missing
+    location_offer table (or its time columns) simply means no offers."""
+    try:
+        rows = db.execute(text(
+            "SELECT location_id, valid_from, valid_to, start_time, end_time, offer_title, offer_text FROM location_offer "
+            "WHERE is_active = 1 ORDER BY (valid_from IS NULL), valid_from, id"
+        )).mappings().all()
+    except SQLAlchemyError:
+        db.rollback()
+        return {}
+    offers = {}
+    for r in rows:
+        offers.setdefault(int(r["location_id"]), []).append(r)
+    return offers
+
 def list_locations(db: Session):
     """All ACTIVE beacon locations: id, name, beacon_id, coordinates, category_id + the category's
     name (location_category, 0 = 'general venue') and min_rssi."""
@@ -1929,10 +2024,22 @@ def list_locations(db: Session):
         "FROM location l LEFT JOIN location_category c ON c.id = l.category_id "
         "WHERE l.is_active = 1 ORDER BY l.id"
     )).mappings().all()
-    return [{"id": int(r["id"]), "name": r["name"] or "", "beacon_id": (r["beacon_id"] or "").lower(),
-             "latitude": float(r["latitude"]), "longitude": float(r["longitude"]),
-             "category_id": int(r["category_id"] or 0), "category": r["category"] or "",
-             "min_rssi": int(r["min_rssi"])} for r in rows]
+    offers = list_location_offers(db)
+    out = []
+    for r in rows:
+        lat, lng = float(r["latitude"]), float(r["longitude"])
+        raw_offers = offers.get(int(r["id"]), [])
+        # The timezone lookup only runs for locations that actually have offers.
+        tz_name = location_timezone(lat, lng) if raw_offers else ""
+        out.append({"id": int(r["id"]), "name": r["name"] or "", "beacon_id": (r["beacon_id"] or "").lower(),
+                    "latitude": lat, "longitude": lng,
+                    "category_id": int(r["category_id"] or 0), "category": r["category"] or "",
+                    "min_rssi": int(r["min_rssi"]), "timezone": tz_name,
+                    "offers": [{"title": o["offer_title"] or "", "text": o["offer_text"] or "",
+                                "valid_from": _offer_moment(o["valid_from"]), "valid_to": _offer_moment(o["valid_to"]),
+                                "start_time": _offer_clock(o["start_time"], tz_name),
+                                "end_time": _offer_clock(o["end_time"], tz_name)} for o in raw_offers]})
+    return out
 
 def set_location_occupancy(db: Session, location_id: int, occupancy: int):
     """Persist the AGGREGATE live occupancy of one location (never who is there)."""

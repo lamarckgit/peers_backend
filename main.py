@@ -2618,7 +2618,7 @@ class RequestPeerByCode(BaseModel):
 # a user to a place is ever stored or logged; only the aggregate goes to location.live_occupancy
 # (throttled). Counts below the floor are reported as 0 so a near-empty venue doesn't reveal who is there.
 _LOC_PRESENCE_WINDOW_S = 600        # a sighting counts for 10 minutes
-_LOC_OCCUPANCY_FLOOR = 2            # API shows 0 below this many people (k-anonymity for small venues)
+_LOC_OCCUPANCY_FLOOR = 1            # API shows 0 below this many people (k-anonymity for small venues)
 _LOC_PERSIST_MIN_S = 60             # write live_occupancy at most once a minute per location
 _LOC_CACHE_S = 60                   # location list cache (beacon lookup on every heartbeat)
 _loc_presence: Dict[int, Dict[str, float]] = {}
