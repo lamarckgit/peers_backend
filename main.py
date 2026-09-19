@@ -2610,6 +2610,122 @@ class RequestPeerByCode(BaseModel):
     code: str
     caller_uuid: str
 
+# ---- Live occupancy at beacon locations (Heat Map live mode) ----
+# Presence is a HEARTBEAT kept only in memory: location id → {caller uuid → last-seen time}. An app
+# that sees a location's beacon reports it (at most once a minute); an entry older than the window no
+# longer counts, so no check-out is needed (the app sends one anyway when it can). A caller counts at
+# ONE location at a time, and ONLY while discoverable by nearby Peers (user.is_active). Nothing linking
+# a user to a place is ever stored or logged; only the aggregate goes to location.live_occupancy
+# (throttled). Counts below the floor are reported as 0 so a near-empty venue doesn't reveal who is there.
+_LOC_PRESENCE_WINDOW_S = 600        # a sighting counts for 10 minutes
+_LOC_OCCUPANCY_FLOOR = 3            # API shows 0 below this many people (k-anonymity for small venues)
+_LOC_PERSIST_MIN_S = 60             # write live_occupancy at most once a minute per location
+_LOC_CACHE_S = 60                   # location list cache (beacon lookup on every heartbeat)
+_loc_presence: Dict[int, Dict[str, float]] = {}
+_loc_persisted: Dict[int, tuple] = {}             # location id → (count, time) last written
+_loc_cache: dict = {"ts": 0.0, "rows": []}
+_loc_lock = threading.Lock()
+
+def _loc_rows(db: Session):
+    now = time.time()
+    if now - _loc_cache["ts"] > _LOC_CACHE_S:
+        _loc_cache["rows"] = response_module.list_locations(db)
+        _loc_cache["ts"] = now
+    return _loc_cache["rows"]
+
+def _loc_count(location_id: int, now: float) -> int:
+    """Live head-count of one location (expired sightings dropped). Caller holds _loc_lock."""
+    seen = _loc_presence.get(location_id)
+    if not seen:
+        return 0
+    for u in [u for u, t in seen.items() if now - t > _LOC_PRESENCE_WINDOW_S]:
+        seen.pop(u, None)
+    return len(seen)
+
+def _loc_persist(db: Session, location_id: int, count: int, now: float):
+    last = _loc_persisted.get(location_id)
+    if last and (last[0] == count or now - last[1] < _LOC_PERSIST_MIN_S):
+        return
+    _loc_persisted[location_id] = (count, now)
+    try:
+        response_module.set_location_occupancy(db, location_id, count)
+    except Exception as e:
+        print(f"location occupancy persist failed: {e}")
+
+class RequestLocations(BaseModel):
+    uuid: str
+
+class RequestLocationSeen(BaseModel):
+    uuid: str
+    beacon_id: str
+    rssi: int = 0
+
+class RequestLocationLeft(BaseModel):
+    uuid: str
+    beacon_id: str = ""
+
+@app.post("/v1/locations/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def locations(params: RequestLocations, db: Session = Depends(get_db)):
+    """The live heat map's venues with their current occupancy (floored), plus the scan parameters."""
+    try:
+        rows = _loc_rows(db)
+        now = time.time()
+        out = []
+        for r in rows:
+            with _loc_lock:
+                n = _loc_count(r["id"], now)
+            out.append({**r, "occupancy": n if n >= _LOC_OCCUPANCY_FLOOR else 0})
+            _loc_persist(db, r["id"], n, now)
+        return {"success": True, "namespace": "688b1b799455d5376505", "window_s": _LOC_PRESENCE_WINDOW_S,
+                "floor": _LOC_OCCUPANCY_FLOOR, "locations": out}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@app.post("/v1/location_seen/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def location_seen(params: RequestLocationSeen, db: Session = Depends(get_db)):
+    """Presence heartbeat: the caller's app currently sees this location's beacon."""
+    try:
+        beacon = (params.beacon_id or "").strip().lower()
+        loc = next((r for r in _loc_rows(db) if r["beacon_id"] == beacon), None)
+        if not loc:
+            return JSONResponse(content={"success": False, "error": "Unknown beacon"}, status_code=status.HTTP_404_NOT_FOUND)
+        # Too faint for this venue (long-range beacon heard from the street), or the caller is NOT
+        # discoverable by nearby Peers (Inactive) → acknowledged but not counted: the map shows only
+        # Peers you could actually meet there.
+        if (params.rssi != 0 and params.rssi < loc["min_rssi"]) or not response_module.peer_is_discoverable(db, params.uuid):
+            with _loc_lock:
+                for seen in _loc_presence.values():
+                    seen.pop(params.uuid, None)
+            return {"success": True, "location_id": loc["id"], "counted": False}
+        now = time.time()
+        with _loc_lock:
+            for lid, seen in _loc_presence.items():       # one location at a time per caller
+                if lid != loc["id"]:
+                    seen.pop(params.uuid, None)
+            _loc_presence.setdefault(loc["id"], {})[params.uuid] = now
+            n = _loc_count(loc["id"], now)
+        _loc_persist(db, loc["id"], n, now)
+        return {"success": True, "location_id": loc["id"], "counted": True}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+@app.post("/v1/location_left/", dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def location_left(params: RequestLocationLeft, db: Session = Depends(get_db)):
+    """Optional early check-out (the beacon went out of range while the app was alive)."""
+    try:
+        now = time.time()
+        touched = []
+        with _loc_lock:
+            for lid, seen in _loc_presence.items():
+                if seen.pop(params.uuid, None) is not None:
+                    touched.append((lid, _loc_count(lid, now)))
+        for lid, n in touched:
+            _loc_persisted.pop(lid, None)                  # a departure is written right away
+            _loc_persist(db, lid, n, now)
+        return {"success": True}
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 # Peer-code guessing guard: a caller gets 3 INVALID lookups (no peer has that code) per rolling hour;
 # a VALID lookup resets the count. In-memory per caller uuid (single-worker backend), swept lazily.
 _CODE_ATTEMPT_LIMIT = 3

@@ -1907,6 +1907,49 @@ def closed_peer_set(db: Session, peer_hexes):
             closed.add(by_uuid[key])
     return closed
 
+# ---- Live occupancy at beacon locations (Heat Map live mode) ----
+# A LOCATION is a venue/area fitted with a Bluetooth beacon advertising an Eddystone-UID frame: the
+# PEERS.CLUB namespace (first 10 bytes of SHA-1("peers.club") = 688b1b799455d5376505) + a 6-byte
+# instance per location. beacon_id = namespace + instance as 32 lowercase hex chars. Apps that see the
+# beacon send presence heartbeats; occupancy is counted IN MEMORY (main.py) — no row ever links a user
+# to a place. Only the aggregate lands here. min_rssi lets a venue ignore far-away sightings
+# Example row (category_id defaults to 0 = 'general venue'):
+#   INSERT INTO location (name, beacon_id, latitude, longitude, min_rssi)
+#   VALUES ('Café De Test', '688b1b799455d5376505000000000001', 52.3702, 4.8952, -90);
+
+def list_locations(db: Session):
+    """All ACTIVE beacon locations: id, name, beacon_id, coordinates, category_id + the category's
+    name (location_category, 0 = 'general venue') and min_rssi."""
+    rows = db.execute(text(
+        "SELECT l.id, l.name, l.beacon_id, l.latitude, l.longitude, l.category_id, "
+        "       c.name AS category, l.min_rssi "
+        "FROM location l LEFT JOIN location_category c ON c.id = l.category_id "
+        "WHERE l.is_active = 1 ORDER BY l.id"
+    )).mappings().all()
+    return [{"id": int(r["id"]), "name": r["name"] or "", "beacon_id": (r["beacon_id"] or "").lower(),
+             "latitude": float(r["latitude"]), "longitude": float(r["longitude"]),
+             "category_id": int(r["category_id"] or 0), "category": r["category"] or "",
+             "min_rssi": int(r["min_rssi"])} for r in rows]
+
+def set_location_occupancy(db: Session, location_id: int, occupancy: int):
+    """Persist the AGGREGATE live occupancy of one location (never who is there)."""
+    db.execute(text("UPDATE location SET live_occupancy = :n, occupancy_ts = CURRENT_TIMESTAMP(6) WHERE id = :id"),
+               {"n": max(0, int(occupancy)), "id": int(location_id)})
+    db.commit()
+
+def peer_is_discoverable(db: Session, peer_hex: str) -> bool:
+    """True when this peer has discovery by nearby Peers enabled (user.is_active = 1 — the app's
+    Active/Inactive switch). ONLY discoverable peers count toward a location's live occupancy: the
+    heat map shows where you can actually meet Peers, and an Inactive (hidden) user stays out of it."""
+    try:
+        b = bytes.fromhex(peer_hex)
+        if len(b) != 16:
+            return False
+        row = db.execute(text("SELECT is_active FROM user WHERE uuid = :u"), {"u": b}).mappings().fetchone()
+        return bool(row and row["is_active"])
+    except Exception:
+        return False
+
 def hide_live_set(db: Session, peer_hexes):
     """Returns the subset of peer_hexes that HIDE their live status (user.hide_live = 1): peers_online
     drops them from `connected`, so friends never see the blue "app open" LED for them. ONE round-trip,
