@@ -1965,13 +1965,18 @@ def location_timezone(latitude: float, longitude: float) -> str:
     _tz_cache[key] = name
     return name
 
-def _offer_moment(value):
+def _offer_moment(value, end: bool = False):
     """UTC DATETIME → 'YYYY-MM-DDTHH:MM:SSZ' (an instant the app compares with its own UTC now);
-    NULL → None."""
+    NULL → None (= open on that side). A plain DATE column works too: valid_from = that day's
+    00:00:00, valid_to (`end`) = the NEXT day's 00:00:00, so the last day is included in full —
+    without this a DATE value was dropped and the offer looked open-ended."""
     if value is None:
         return None
     if isinstance(value, datetime):
         return value.replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+    if hasattr(value, "year") and hasattr(value, "day"):          # datetime.date
+        day = datetime(value.year, value.month, value.day) + (timedelta(days=1) if end else timedelta(0))
+        return day.isoformat() + "Z"
     return None
 
 def _offer_clock(value, tz_name: str):
@@ -2036,7 +2041,7 @@ def list_locations(db: Session):
                     "category_id": int(r["category_id"] or 0), "category": r["category"] or "",
                     "min_rssi": int(r["min_rssi"]), "timezone": tz_name,
                     "offers": [{"title": o["offer_title"] or "", "text": o["offer_text"] or "",
-                                "valid_from": _offer_moment(o["valid_from"]), "valid_to": _offer_moment(o["valid_to"]),
+                                "valid_from": _offer_moment(o["valid_from"]), "valid_to": _offer_moment(o["valid_to"], end=True),
                                 "start_time": _offer_clock(o["start_time"], tz_name),
                                 "end_time": _offer_clock(o["end_time"], tz_name)} for o in raw_offers]})
     return out
