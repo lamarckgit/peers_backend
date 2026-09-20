@@ -904,7 +904,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
             # Group chat messages have no single target — the relay fans them out to all members.
             # GROUP_CLEAR = the admin wiped the whole group history (members wipe their transcript).
-            if data.get("type") in ("GROUP_MESSAGE", "GROUP_EDIT", "GROUP_DELETE", "GROUP_CLEAR"):
+            # GROUP_REACTION = a member's emoji reaction to a group message (msgId + text, "" clears):
+            # same fan-out (members, their offline devices, the sender's own other devices), no push.
+            if data.get("type") in ("GROUP_MESSAGE", "GROUP_EDIT", "GROUP_DELETE", "GROUP_CLEAR", "GROUP_REACTION"):
                 data["sender"] = client_id
                 await relay_group_message(client_id, data, data.get("type"), origin_ws=websocket,
                                           origin_device=device)
