@@ -1041,9 +1041,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # MULTI-DEVICE ECHO: mirror chat state to the SENDER's other (echo-capable) devices,
                 # so an iPhone + Mac sharing one uuid show the same conversation. Old clients never
                 # opt in, so they never see these frames.
+                # CHAT_REACTION belongs here too: without it a reaction never reached the sender's
+                # other devices, nor the target's device that was offline while a sibling was online.
                 if target_id != client_id and msg_type in (
                         "CHAT_MESSAGE", "CHAT_EDIT", "CHAT_DELETE", "CHAT_READ", "CHAT_CLEAR",
-                        "LOCATION_UPDATE", "LOCATION_STOP"):
+                        "CHAT_REACTION", "LOCATION_UPDATE", "LOCATION_STOP"):
                     await manager.send_all(client_id, data, exclude_ws=websocket, echo_capable_only=True)
                     # The SENDER's offline sibling (killed Mac / killed iPhone) catches up on reconnect…
                     manager.enqueue_echo(client_id, data, exclude_device=device)
