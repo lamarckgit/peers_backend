@@ -865,15 +865,16 @@ async def relay_group_message(client_id: str, data: dict, msg_type: str, origin_
                     # Raise a visible push when the member's PHONE didn't get a live copy — but NOT
                     # for a system line (created/welcome/left).
                     if msg_type == "GROUP_MESSAGE" and not data.get("groupSystem"):
-                        fcm_token, _, _ = response_module.get_peer_push_info(s, member_id)
-                        if fcm_token:
+                        targets = [t for t in response_module.get_peer_push_targets(s, member_id) if t.fcm_token]
+                        if targets:
                             badge = manager.next_badge(member_id)
                             push_text = data.get("text") or (
                                 "📄 " + (data.get("docName") or "Document") if data.get("docId") else "")
-                            response_module.send_group_message_push(
-                                fcm_token, client_id, sender_name, str(group_id),
-                                data.get("groupName") or "", push_text,
-                                badge, data.get("msgId") or "")
+                            for t in targets:   # one push per registered device/app of the member
+                                response_module.send_group_message_push(
+                                    t.fcm_token, client_id, sender_name, str(group_id),
+                                    data.get("groupName") or "", push_text,
+                                    badge, data.get("msgId") or "", product=t.product)
         finally:
             s.close()
     except Exception as e:
@@ -1074,9 +1075,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             s = database.create_session()
                             try:
                                 if response_module.are_friends(s, client_id, target_id):
-                                    fcm_token, _, _ = response_module.get_peer_push_info(s, target_id)
+                                    targets = [t for t in response_module.get_peer_push_targets(s, target_id) if t.fcm_token]
                                     _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
-                                    if fcm_token:
+                                    if targets:
                                         badge = manager.next_badge(target_id)
                                         # Banner fallback for caption-less media (the data.text stays the REAL
                                         # caption — the app stores it as the message text).
@@ -1087,14 +1088,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                                       else "👤 Contact" if data.get("contactCard")
                                                       else "📊 Poll" if data.get("pollId")
                                                       else "📍 Location" if data.get("latitude") is not None else "")
-                                        ok = response_module.send_chat_message_push(
-                                            fcm_token, client_id, sender_name,
-                                            data.get("text") or "", badge, data.get("msgId") or "",
-                                            video_id=data.get("videoId") or "", kind_label=kind_label,
-                                            quoted_text=data.get("quotedText") or "",
-                                            quoted_author=data.get("quotedAuthorName") or "",
-                                            e2ee=bool(data.get("e2ee")))
-                                        print(f"relay: chat-msg push to {target_id[:8]} sent={ok} badge={badge}")
+                                        ok = 0
+                                        for t in targets:   # one push per registered device/app
+                                            ok += response_module.send_chat_message_push(
+                                                t.fcm_token, client_id, sender_name,
+                                                data.get("text") or "", badge, data.get("msgId") or "",
+                                                video_id=data.get("videoId") or "", kind_label=kind_label,
+                                                quoted_text=data.get("quotedText") or "",
+                                                quoted_author=data.get("quotedAuthorName") or "",
+                                                e2ee=bool(data.get("e2ee")), product=t.product)
+                                        print(f"relay: chat-msg push to {target_id[:8]} sent={ok}/{len(targets)} badge={badge}")
                                     else:
                                         print(f"relay: offline friend {target_id[:8]} has no push token")
                                 else:
@@ -1121,7 +1124,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 if msg_type in ("CALL_REQUEST", "CALL_CANCEL") and not response_module.are_friends(s, client_id, target_id):
                                     print(f"relay: {msg_type} to offline {target_id[:8]} suppressed (sender not a friend)")
                                 else:
-                                    fcm_token, _, voip_token = response_module.get_peer_push_info(s, target_id)
+                                    targets = response_module.get_peer_push_targets(s, target_id)
                                     _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
                                     # Carry the call's audio/video flag through to the push.
                                     extra = {"video": "1" if data.get("video") else "0"} if msg_type == "CALL_REQUEST" else None
@@ -1130,20 +1133,22 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     if msg_type == "GROUP_INVITE":
                                         extra = {"group_id": str(data.get("groupId") or ""),
                                                  "group_name": data.get("groupName") or ""}
-                                    sent = False
-                                    # A CALL to a CallKit-capable peer → native VoIP push (rings via
-                                    # CallKit from a killed/locked state). Everything else (chat/friend,
-                                    # or a peer with no VoIP token e.g. China) → FCM notification.
-                                    if msg_type == "CALL_REQUEST" and voip_token:
-                                        sent = response_module.send_voip_push(voip_token, msg_type, client_id, sender_name, extra)
-                                        print(f"relay: VoIP push to {target_id[:8]} {msg_type} sent={sent}")
-                                    if not sent and fcm_token:
-                                        # A friend request / acceptance creates an unread chat card / message,
-                                        # so badge the app icon (killed app), like a chat message.
-                                        push_badge = manager.next_badge(target_id) if msg_type in ("FRIEND_REQUEST", "FRIEND_ACCEPT", "GROUP_INVITE") else None
-                                        sent = response_module.send_signal_push(fcm_token, msg_type, client_id, sender_name, extra, badge=push_badge)
-                                        print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={sent}")
-                                    if not sent and not voip_token and not fcm_token:
+                                    # A friend request / acceptance creates an unread chat card / message,
+                                    # so badge the app icon (killed app), like a chat message. One badge
+                                    # value for all of the peer's devices.
+                                    push_badge = manager.next_badge(target_id) if msg_type in ("FRIEND_REQUEST", "FRIEND_ACCEPT", "GROUP_INVITE") else None
+                                    for t in targets:   # every registered device/app of the peer
+                                        sent = False
+                                        # A CALL to a CallKit-capable device → native VoIP push (rings via
+                                        # CallKit from a killed/locked state). Everything else (chat/friend,
+                                        # or a device with no VoIP token e.g. China) → FCM notification.
+                                        if msg_type == "CALL_REQUEST" and t.voip_token:
+                                            sent = response_module.send_voip_push(t.voip_token, msg_type, client_id, sender_name, extra, product=t.product)
+                                            print(f"relay: VoIP push to {target_id[:8]} {msg_type} sent={sent}")
+                                        if not sent and t.fcm_token:
+                                            sent = response_module.send_signal_push(t.fcm_token, msg_type, client_id, sender_name, extra, badge=push_badge, product=t.product)
+                                            print(f"relay: FCM fallback to {target_id[:8]} {msg_type} sent={sent}")
+                                    if not targets:
                                         print(f"relay: offline target {target_id[:8]} has no push token")
                             finally:
                                 s.close()
@@ -1156,14 +1161,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         try:
                             s = database.create_session()
                             try:
-                                fcm_token, _, _ = response_module.get_peer_push_info(s, target_id)
+                                targets = [t for t in response_module.get_peer_push_targets(s, target_id) if t.fcm_token]
                                 _, sender_name, _ = response_module.get_peer_push_info(s, client_id)
-                                if fcm_token:
-                                    sent = response_module.send_group_call_push(
-                                        fcm_token, client_id, sender_name,
-                                        str(data.get("groupId") or ""), data.get("groupName") or "",
-                                        bool(data.get("video")))
-                                    print(f"relay: group-call push to {target_id[:8]} sent={sent}")
+                                if targets:
+                                    sent = 0
+                                    for t in targets:   # one push per registered device/app
+                                        sent += response_module.send_group_call_push(
+                                            t.fcm_token, client_id, sender_name,
+                                            str(data.get("groupId") or ""), data.get("groupName") or "",
+                                            bool(data.get("video")), product=t.product)
+                                    print(f"relay: group-call push to {target_id[:8]} sent={sent}/{len(targets)}")
                                 else:
                                     print(f"relay: offline member {target_id[:8]} has no push token")
                             finally:
@@ -1453,6 +1460,14 @@ class RequestStoreFCMToken(BaseModel):
 class RequestStoreVoipToken(BaseModel):
     uuid: str
     voip_token: str
+
+class RequestRegisterDevice(BaseModel):
+    uuid: str
+    device_id: str                    # stable per install (the same id the WS ?device= carries)
+    product: str = ""                 # push product: "peersclub" | "souverain" ("" = this backend's native app)
+    platform: str = ""                # "ios" | "android" | "macos" | "windows"
+    fcm_token: Optional[str] = None   # only the tokens supplied are updated
+    voip_token: Optional[str] = None
 
 class RequestSetE2eeKey(BaseModel):
     uuid: str
@@ -1972,9 +1987,9 @@ async def nearby_wake(params: RequestUuid, db: Session = Depends(get_db)):
         targets.discard(params.uuid)
         sent = 0
         for target in list(targets)[:32]:   # bounded fan-out
-            fcm_token, _, _ = response_module.get_peer_push_info(db, target)
-            if fcm_token and response_module.send_silent_wake(fcm_token):
-                sent += 1
+            for t in response_module.get_peer_push_targets(db, target):
+                if t.fcm_token and response_module.send_silent_wake(t.fcm_token, product=t.product):
+                    sent += 1
         print(f"nearby_wake: {params.uuid[:8]} kicked {sent} peer(s)")
         return response_module.ResponseResult(success=True, error="")
     except Exception as e:
@@ -2026,6 +2041,22 @@ async def peer_nearby(params: RequestAddFriend):
 async def register_peer_token(params: RequestStoreFCMToken, db: Session = Depends(get_db)):
     try:
         return response_module.register_peer_token(db, params.uuid, params.fcm_token)
+    except HTTPException as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# Per-DEVICE push registration: one row per (peer, device) so a peer reachable through several
+# apps/devices keeps a token for each (iPhone + Mac, or the PEERS.CLUB and Souverain apps on one
+# phone). The two legacy endpoints above/below stay as they are for older clients; a NATIVE-product
+# registration here is mirrored into the legacy columns so nothing else changes. Unknown to an older
+# backend (404) — a client must not fall back to the legacy endpoints on a FOREIGN system, or it
+# would overwrite that user's native app token there.
+@app.post("/v1/register_device/", response_model=response_module.ResponseResult, dependencies=[Depends(verify_api_key), Depends(check_peer_uuid)])
+async def register_device(params: RequestRegisterDevice, db: Session = Depends(get_db)):
+    try:
+        return response_module.register_device(db, params.uuid, params.device_id, params.product, params.platform,
+                                               params.fcm_token, params.voip_token)
     except HTTPException as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=e.status_code)
     except Exception as e:

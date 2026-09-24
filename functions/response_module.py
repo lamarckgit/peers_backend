@@ -10,6 +10,7 @@ from helpers.email_templates import *
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 from pydantic import BaseModel
+from typing import NamedTuple, Optional
 import random
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -30,20 +31,34 @@ from firebase_admin import credentials, messaging
 app_bellxs = None
 app_safexs = None
 
-# --- Initialize PEERS.CLUB (used to push INCOMING_CHAT to a backgrounded peer) ---
-# Sending FCM to the peers.club iOS app (Firebase project "peers-club") requires THAT project's
-# own service-account key. Drop serviceAccountKeyPeersClub.json next to the other two. When it's
-# absent, background chat push is simply disabled — foreground chat over the WS relay still works.
-app_peers = None
-try:
-    cred_peers = credentials.Certificate("serviceAccountKeyPeersClub.json")
-    app_peers = firebase_admin.initialize_app(cred_peers, name='peers_app')
-    print("PEERS.CLUB Firebase app initialized successfully.")
-except (FileNotFoundError, IOError):
-    print("PEERS.CLUB service account 'serviceAccountKeyPeersClub.json' not found — "
-          "background chat push disabled (foreground chat still works).")
-except ValueError:
-    print("PEERS.CLUB Firebase app already initialized.")
+# --- Push products -----------------------------------------------------------------------------
+# A push "product" is one app family with its own Firebase project (FCM) and APNs VoIP topic. This
+# backend's NATIVE product is the app it was built for; a SIBLING product (e.g. the Souverain app
+# listing its PEERS.CLUB friends, or vice versa) can register per-device tokens here too — those
+# are pushed through THAT product's Firebase app / VoIP topic, so its service-account key must be
+# present next to main.py as well. A product whose key file is absent is simply skipped.
+NATIVE_PRODUCT = "peersclub"
+PUSH_PRODUCTS = {
+    "peersclub": {"cred_file": "serviceAccountKeyPeersClub.json", "voip_topic": "club.peers.ios.voip"},
+    "souverain": {"cred_file": "serviceAccountKeySouverain.json", "voip_topic": "pro.souverain.ios.voip"},
+}
+_push_apps = {}
+for _product, _cfg in PUSH_PRODUCTS.items():
+    try:
+        _push_apps[_product] = firebase_admin.initialize_app(credentials.Certificate(_cfg["cred_file"]), name=f"push_{_product}")
+        print(f"Firebase app for '{_product}' initialized ({_cfg['cred_file']}).")
+    except (FileNotFoundError, IOError):
+        if _product == NATIVE_PRODUCT:
+            print(f"Service account '{_cfg['cred_file']}' not found — background push for the native app "
+                  f"'{_product}' disabled (foreground chat over the WS relay still works).")
+    except ValueError:
+        print(f"Firebase app for '{_product}' already initialized.")
+# The native product's app under its historical name — every existing sender defaults to it.
+app_peers = _push_apps.get(NATIVE_PRODUCT)
+
+def _fb_app(product: str = None):
+    """The Firebase app to push through for `product` (None/unknown → the native app)."""
+    return _push_apps.get(product or NATIVE_PRODUCT) or (app_peers if not product or product == NATIVE_PRODUCT else None)
 
 class ResponseCreatePeer(BaseModel):
     success: bool
@@ -740,6 +755,123 @@ def register_peer_voip_token(db: Session, peer_hex: str, token: str):
     except Exception as e:
         raise Exception(f"Exception error: {str(e)}")
 
+class PushTarget(NamedTuple):
+    product: str
+    fcm_token: Optional[str]
+    voip_token: Optional[str]
+    device_id: str = ""
+
+def register_device(db: Session, peer_hex: str, device_id: str, product: str, platform: str,
+                    fcm_token: Optional[str], voip_token: Optional[str]):
+    """Per-DEVICE push registration (`POST /v1/register_device/`): one row per (peer, device) in
+    user_device, so a peer reachable through several apps/devices (iPhone + Mac, or the PEERS.CLUB
+    and Souverain apps on one phone) keeps a token for EACH. Only the tokens supplied are updated.
+    The legacy user.fcm_token / user.voip_token columns are mirrored for the NATIVE product so every
+    pre-device code path and every older client keep working unchanged. Prerequisite DDL:
+      CREATE TABLE user_device (
+        id INT(10) UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        uuid BINARY(16) NOT NULL, device_id VARCHAR(64) NOT NULL,
+        product VARCHAR(32) NOT NULL DEFAULT '', platform VARCHAR(16) NOT NULL DEFAULT '',
+        fcm_token VARCHAR(4096) DEFAULT NULL, voip_token VARCHAR(255) DEFAULT NULL,
+        created_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        modified_ts TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+        created_by_id INT(10) UNSIGNED DEFAULT NULL, modified_by_id INT(10) UNSIGNED DEFAULT NULL,
+        UNIQUE KEY uq_user_device (uuid, device_id),
+        CONSTRAINT fk_user_device_user FOREIGN KEY (uuid) REFERENCES user (uuid) ON DELETE CASCADE ON UPDATE CASCADE);"""
+    try:
+        try:
+            peer_uuid = bytes.fromhex(peer_hex)
+        except ValueError:
+            raise Exception("Invalid peer uuid")
+        if len(peer_uuid) != 16:
+            raise Exception("Invalid peer uuid")
+        device_id = (device_id or "").strip()[:64]
+        if not device_id:
+            raise Exception("device_id required")
+        product = (product or NATIVE_PRODUCT).strip()[:32]
+        platform = (platform or "").strip()[:16]
+        fcm_token = fcm_token or None
+        voip_token = voip_token or None
+        row = db.execute(text("SELECT id FROM user_device WHERE uuid = :uuid AND device_id = :dev"),
+                         {"uuid": peer_uuid, "dev": device_id}).fetchone()
+        if row:
+            sets = ["product = :product", "platform = :platform"]
+            params = {"id": row[0], "product": product, "platform": platform}
+            if fcm_token is not None:
+                sets.append("fcm_token = :fcm"); params["fcm"] = fcm_token
+            if voip_token is not None:
+                sets.append("voip_token = :voip"); params["voip"] = voip_token
+            db.execute(text(f"UPDATE user_device SET {', '.join(sets)} WHERE id = :id"), params)
+        else:
+            db.execute(text("""INSERT INTO user_device (uuid, device_id, product, platform, fcm_token, voip_token)
+                               VALUES (:uuid, :dev, :product, :platform, :fcm, :voip)"""),
+                       {"uuid": peer_uuid, "dev": device_id, "product": product, "platform": platform,
+                        "fcm": fcm_token, "voip": voip_token})
+        if product == NATIVE_PRODUCT:
+            # Mirror into the legacy columns (old code paths, and the peer's OTHER older devices
+            # never see a stale token because the newest native device wins, as before).
+            if fcm_token is not None:
+                db.execute(text("UPDATE user SET fcm_token = :t WHERE uuid = :uuid"), {"t": fcm_token, "uuid": peer_uuid})
+            if voip_token is not None:
+                db.execute(text("UPDATE user SET voip_token = :t WHERE uuid = :uuid"), {"t": voip_token, "uuid": peer_uuid})
+        db.commit()
+        return ResponseResult(success=True, error="")
+    except SQLAlchemyError as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+    except Exception as e:
+        raise Exception(f"Exception error: {str(e)}")
+
+# Tokens FCM reported as unregistered (app uninstalled / token rotated): forgotten on the next lookup.
+_dead_fcm_tokens = set()
+
+def forget_dead_token(token: str):
+    if token:
+        _dead_fcm_tokens.add(token)
+
+def get_peer_push_targets(db: Session, peer_hex: str):
+    """ALL push targets of a peer: the legacy user.fcm_token/voip_token pair (native product) plus
+    every user_device row, de-duplicated by token. Dead tokens are dropped (and their device rows
+    deleted). Returns [] for an unknown/invalid peer — callers loop and push to each target."""
+    try:
+        peer_uuid = bytes.fromhex(peer_hex)
+    except ValueError:
+        return []
+    if len(peer_uuid) != 16:
+        return []
+    targets, seen_fcm, seen_voip = [], set(), set()
+    def add(product, fcm, voip, device_id=""):
+        if fcm in _dead_fcm_tokens:
+            fcm = None
+        if fcm in seen_fcm:
+            fcm = None
+        if voip in seen_voip:
+            voip = None
+        if not fcm and not voip:
+            return
+        if fcm: seen_fcm.add(fcm)
+        if voip: seen_voip.add(voip)
+        targets.append(PushTarget(product or NATIVE_PRODUCT, fcm, voip, device_id))
+    row = db.execute(text("SELECT fcm_token, voip_token FROM user WHERE uuid = :uuid"), {"uuid": peer_uuid}).mappings().fetchone()
+    if not row:
+        return []
+    add(NATIVE_PRODUCT, row["fcm_token"], row["voip_token"])
+    try:
+        rows = db.execute(text("""SELECT device_id, product, fcm_token, voip_token FROM user_device
+                                  WHERE uuid = :uuid ORDER BY modified_ts DESC"""), {"uuid": peer_uuid}).mappings().fetchall()
+    except SQLAlchemyError:
+        rows = []   # table not created yet — legacy behaviour only
+        db.rollback()
+    for r in rows:
+        if r["fcm_token"] and r["fcm_token"] in _dead_fcm_tokens:
+            try:
+                db.execute(text("DELETE FROM user_device WHERE uuid = :uuid AND device_id = :dev"), {"uuid": peer_uuid, "dev": r["device_id"]})
+                db.commit()
+            except SQLAlchemyError:
+                db.rollback()
+            continue
+        add(r["product"], r["fcm_token"], r["voip_token"], r["device_id"])
+    return targets
+
 def get_peer_push_info(db: Session, peer_hex: str):
     """Returns (fcm_token, name, voip_token) for a peer by hex uuid; (None, "", None) when
     unknown/invalid. voip_token is set only for CallKit-capable peers (used for call wake-ups)."""
@@ -826,13 +958,14 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
     return data, android_config, apns_config
 
 
-def send_silent_wake(target_token: str) -> bool:
+def send_silent_wake(target_token: str, product: str = None) -> bool:
     """Data-only 'NEARBY_WAKE': nudges a backgrounded/locked app to restart its BLE scan so a
     freshly-discoverable nearby peer is found in seconds instead of at the next address rotation
     (up to ~15 min for a locked iPhone's duplicate-filtered background scan). Silent on iOS
     (content-available, no alert — subject to Apple's silent-push budget), a plain data message on
     Android. False on not-configured / empty token / error."""
-    if app_peers is None or not target_token:
+    fb = _fb_app(product)
+    if fb is None or not target_token:
         return False
     try:
         message = messaging.Message(
@@ -844,16 +977,19 @@ def send_silent_wake(target_token: str) -> bool:
                 payload=messaging.APNSPayload(aps=messaging.Aps(content_available=True)),
             ),
         )
-        messaging.send(message, app=app_peers)
+        messaging.send(message, app=fb)
         return True
     except Exception as e:
+        if isinstance(e, messaging.UnregisteredError):
+            forget_dead_token(target_token)
         print(f"send_silent_wake error [{type(e).__name__}]: {e}")
         return False
 
 
 def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str, text: str, badge: int,
                            msg_id: str = "", video_id: str = "", kind_label: str = "",
-                           quoted_text: str = "", quoted_author: str = "", e2ee: bool = False) -> bool:
+                           quoted_text: str = "", quoted_author: str = "", e2ee: bool = False,
+                           product: str = None) -> bool:
     """Visible 'new message' push for a FRIEND's chat message to an offline/backgrounded peer:
       • aps.alert (title = sender name, body = the message text) → a real banner on the lock screen
         / a notification while the receiver is in another app,
@@ -865,7 +1001,8 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
       • text + msg_id in `data` so the app stores the message and de-dups (a suspended app may process
         the push in the background AND again on tap). action=NEW_MESSAGE → tap opens the chat.
     False (no raise) on not-configured / empty-token / error."""
-    if app_peers is None:
+    fb = _fb_app(product)
+    if fb is None:
         print("send_chat_message_push: PEERS.CLUB Firebase app not configured — push skipped.")
         return False
     if not target_token:
@@ -905,20 +1042,24 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
     )
     try:
         message = messaging.Message(token=target_token, data=data, android=android_config, apns=apns_config)
-        response = messaging.send(message, app=app_peers)
+        response = messaging.send(message, app=fb)
         print(f"send_chat_message_push: from {sender_hex[:8]} badge={badge} → {response}")
         return True
     except Exception as e:
+        if isinstance(e, messaging.UnregisteredError):
+            forget_dead_token(target_token)
         print(f"send_chat_message_push error [{type(e).__name__}]: {e}")
         return False
 
 
 def send_group_message_push(target_token: str, sender_hex: str, sender_name: str, group_id: str,
-                            group_name: str, text: str, badge: int, msg_id: str = "") -> bool:
+                            group_name: str, text: str, badge: int, msg_id: str = "",
+                           product: str = None) -> bool:
     """Visible 'new group message' push to ONE offline/backgrounded group member. Title = the group name,
     body = '<sender>: <text>'. action=GROUP_MESSAGE + group_id/group_name so a tap opens the group chat,
     text + msg_id so the app stores the message (de-dup). False (no raise) on not-configured/empty/error."""
-    if app_peers is None:
+    fb = _fb_app(product)
+    if fb is None:
         print("send_group_message_push: PEERS.CLUB Firebase app not configured — push skipped.")
         return False
     if not target_token:
@@ -942,21 +1083,25 @@ def send_group_message_push(target_token: str, sender_hex: str, sender_name: str
     )
     try:
         message = messaging.Message(token=target_token, data=data, android=android_config, apns=apns_config)
-        response = messaging.send(message, app=app_peers)
+        response = messaging.send(message, app=fb)
         print(f"send_group_message_push: group {group_id} from {sender_hex[:8]} badge={badge} → {response}")
         return True
     except Exception as e:
+        if isinstance(e, messaging.UnregisteredError):
+            forget_dead_token(target_token)
         print(f"send_group_message_push error [{type(e).__name__}]: {e}")
         return False
 
 
 def send_group_call_push(target_token: str, sender_hex: str, sender_name: str, group_id: str,
-                         group_name: str, video: bool) -> bool:
+                         group_name: str, video: bool,
+                           product: str = None) -> bool:
     """Visible 'incoming group call' push to ONE offline/backgrounded member (FCM alert; no CallKit for
     groups yet). Title = the group name, body = '<name> is starting a group audio/video call'. action =
     GROUP_CALL_REQUEST + group_id/group_name/video so the app rings the incoming group-call dialog on tap.
     False (no raise) on not-configured / empty token / error."""
-    if app_peers is None:
+    fb = _fb_app(product)
+    if fb is None:
         print("send_group_call_push: PEERS.CLUB Firebase app not configured — push skipped.")
         return False
     if not target_token:
@@ -980,15 +1125,17 @@ def send_group_call_push(target_token: str, sender_hex: str, sender_name: str, g
     )
     try:
         message = messaging.Message(token=target_token, data=data, android=android_config, apns=apns_config)
-        response = messaging.send(message, app=app_peers)
+        response = messaging.send(message, app=fb)
         print(f"send_group_call_push: group {group_id} from {sender_hex[:8]} → {response}")
         return True
     except Exception as e:
+        if isinstance(e, messaging.UnregisteredError):
+            forget_dead_token(target_token)
         print(f"send_group_call_push error [{type(e).__name__}]: {e}")
         return False
 
 
-def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None, badge: int = None) -> bool:
+def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None, badge: int = None, product: str = None) -> bool:
     """Pushes a signaling event (chat / friend / call) to ONE backgrounded/killed peer via the
     PEERS.CLUB Firebase app. Payload is built by _build_signal_payload (mirrors the SafeXS doorbell
     push). For fanning the same signal out to several devices (group calls) use send_signal_push_multi.
@@ -996,7 +1143,8 @@ def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_n
 
     NOTE: delivery to iOS requires the peers-club Firebase project to have an APNs Authentication Key
     configured (Project Settings → Cloud Messaging). Without it FCM returns THIRD_PARTY_AUTH_ERROR."""
-    if app_peers is None:
+    fb = _fb_app(product)
+    if fb is None:
         print("send_signal_push: PEERS.CLUB Firebase app not configured — push skipped.")
         return False
     if not target_token:
@@ -1009,10 +1157,12 @@ def send_signal_push(target_token: str, msg_type: str, sender_hex: str, sender_n
             android=android_config,
             apns=apns_config,
         )
-        response = messaging.send(message, app=app_peers)
+        response = messaging.send(message, app=fb)
         print(f"send_signal_push: {msg_type} from {sender_hex[:8]} → {response}")
         return True
     except Exception as e:
+        if isinstance(e, messaging.UnregisteredError):
+            forget_dead_token(target_token)
         print(f"send_signal_push error [{type(e).__name__}]: {e}")
         return False
 
@@ -1055,20 +1205,20 @@ def _apns_auth_token():
     _apns_jwt["iat"] = now
     return token
 
-def _apns_post(host: str, voip_token: str, payload: dict, auth: str):
+def _apns_post(host: str, voip_token: str, payload: dict, auth: str, topic: str = None):
     global _apns_client
     if _apns_client is None:
         _apns_client = httpx.Client(http2=True, timeout=10.0)   # keeps the HTTP/2 connection alive
     headers = {
         "authorization": f"bearer {auth}",
-        "apns-topic": APNS_VOIP_TOPIC,
+        "apns-topic": topic or APNS_VOIP_TOPIC,
         "apns-push-type": "voip",
         "apns-priority": "10",
         "apns-expiration": "0",
     }
     return _apns_client.post(f"https://{host}/3/device/{voip_token}", json=payload, headers=headers)
 
-def send_voip_push(voip_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None) -> bool:
+def send_voip_push(voip_token: str, msg_type: str, sender_hex: str, sender_name: str, extra: dict = None, product: str = None) -> bool:
     """Sends a PushKit VoIP push DIRECTLY to APNs so a killed/locked peer rings via CallKit. The
     payload's top-level keys (action/sender_id/sender_name/video) match what the iOS PushKit handler
     reads. Tries production APNs, retrying sandbox on BadDeviceToken (dev builds use sandbox tokens).
@@ -1081,11 +1231,12 @@ def send_voip_push(voip_token: str, msg_type: str, sender_hex: str, sender_name:
     payload = {"aps": {}, "action": msg_type, "sender_id": sender_hex, "sender_name": sender_name or ""}
     if extra:
         payload.update(extra)
+    topic = PUSH_PRODUCTS.get(product or NATIVE_PRODUCT, {}).get("voip_topic") or APNS_VOIP_TOPIC
     try:
         auth = _apns_auth_token()
-        resp = _apns_post(_APNS_HOST_PROD, voip_token, payload, auth)
+        resp = _apns_post(_APNS_HOST_PROD, voip_token, payload, auth, topic)
         if resp.status_code == 400 and "BadDeviceToken" in resp.text:
-            resp = _apns_post(_APNS_HOST_SANDBOX, voip_token, payload, auth)
+            resp = _apns_post(_APNS_HOST_SANDBOX, voip_token, payload, auth, topic)
         if resp.status_code == 200:
             print(f"send_voip_push: {msg_type} from {sender_hex[:8]} → 200")
             return True
