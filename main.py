@@ -17,6 +17,7 @@ import fastapi
 from classes.database_class import Database
 from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
+from functions import app_settings as app_settings_module
 from functions import response_module
 from functions import attest_module # Not from functions.response_module import * because duplicate method name conflicts
 from functions import demo_bot       # App Store review demo contact — isolated; see functions/demo_bot.py
@@ -2031,6 +2032,16 @@ async def peer_nearby(params: RequestAddFriend):
         await manager.send_all(params.friend_uuid,
                                {"type": "PEER_NEARBY", "sender": params.uuid, "target": params.friend_uuid})
         return response_module.ResponseResult(success=True, error="")
+    except Exception as e:
+        return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# App-wide feature settings (see functions/app_settings.py): X-API-Key only — fetched at launch,
+# BEFORE a profile exists (onboarding needs to know whether Bluetooth discovery is part of this system).
+@app.post("/v1/settings/", dependencies=[Depends(verify_api_key)])
+async def app_settings():
+    try:
+        values = app_settings_module.get_app_settings(license_manager.get_constants())
+        return {"success": True, **values}
     except Exception as e:
         return JSONResponse(content={"success": False, "error": str(e)}, status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
