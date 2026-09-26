@@ -10,6 +10,7 @@ from helpers.email_templates import *
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException, status
 from pydantic import BaseModel
+from functions import app_settings as _app_settings
 from typing import NamedTuple, Optional
 import random
 from sqlalchemy.orm import Session
@@ -936,6 +937,7 @@ def _build_signal_payload(msg_type: str, sender_hex: str, sender_name: str, extr
     # iOS routing actions: chat → INCOMING_CHAT, call → INCOMING_CALL, friend → the WS type verbatim.
     fcm_action = {"CHAT_REQUEST": "INCOMING_CHAT", "CALL_REQUEST": "INCOMING_CALL"}.get(msg_type, msg_type)
     data = {"action": fcm_action, "sender_id": sender_hex, "sender_name": name}
+    data["system"] = _app_settings.system_hint()   # which backend this push is about (multi-system apps)
     if extra:
         data.update({k: str(v) for k, v in extra.items()})
     aps_object = messaging.Aps(
@@ -1019,10 +1021,12 @@ def send_chat_message_push(target_token: str, sender_hex: str, sender_name: str,
         data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
                 "text": (text or "") if len(text or "") <= 2800 else "",
                 "msg_id": msg_id or "", "video_id": video_id or "", "e2ee": "1"}
+        data["system"] = _app_settings.system_hint()   # which backend this push is about (multi-system apps)
     else:
         body = text or kind_label or "New message"
         data = {"action": "NEW_MESSAGE", "sender_id": sender_hex, "sender_name": name,
                 "text": text or "", "msg_id": msg_id or "", "video_id": video_id or ""}
+        data["system"] = _app_settings.system_hint()   # which backend this push is about (multi-system apps)
         # A Reply's quote rides along (text + author only — small enough for the push size budget; a
         # quoted IMAGE stays out and is delivered by the reconnect catch-up flush). The app stores these
         # so a killed-app receiver shows the reply's quote immediately, not just on reconnect.
@@ -1069,6 +1073,7 @@ def send_group_message_push(target_token: str, sender_hex: str, sender_name: str
     body = f"{name}: {text}" if text else f"{name} sent a message"
     data = {"action": "GROUP_MESSAGE", "sender_id": sender_hex, "sender_name": name,
             "group_id": str(group_id), "group_name": group_name or "", "text": text or "", "msg_id": msg_id or ""}
+    data["system"] = _app_settings.system_hint()   # which backend this push is about (multi-system apps)
     aps_object = messaging.Aps(
         alert=messaging.ApsAlert(title=title, body=body),
         sound="default",
@@ -1112,6 +1117,7 @@ def send_group_call_push(target_token: str, sender_hex: str, sender_name: str, g
     data = {"action": "GROUP_CALL_REQUEST", "sender_id": sender_hex, "sender_name": name,
             "group_id": str(group_id), "group_name": group_name or "", "video": "1" if video else "0",
             "ts": str(int(time.time()))}   # lets a cold-launched app drop a stale (missed) ring
+    data["system"] = _app_settings.system_hint()   # which backend this push is about (multi-system apps)
     aps_object = messaging.Aps(
         alert=messaging.ApsAlert(title=title, body=body),
         sound="default",

@@ -10,6 +10,8 @@ overrides the file, so nothing in the clients changes when that lands.
   cross_system_discovery  B: members of THIS system may be discovered over Bluetooth by members of
                           the OTHER systems configured in their app (and vice versa). Only meaningful
                           with more than one system; the app shows an opt-out toggle for it.
+  public_url              This backend's public base URL as the apps configure it; stamped as
+                          "system" into pushes (see system_hint()).
 """
 import json
 import os
@@ -18,6 +20,10 @@ import threading
 _DEFAULTS = {
     "bluetooth_discovery": True,
     "cross_system_discovery": True,
+    # This backend's public base URL as the apps configure it (e.g. "https://api.peers.club/peers").
+    # Stamped as "system" into every push so a multi-system app knows WHICH system a push is about
+    # (group ids and sender uuids are only meaningful per system). "" = not configured.
+    "public_url": "",
 }
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS_PATH = os.environ.get("APP_SETTINGS_PATH", os.path.join(_ROOT, "settings.json"))
@@ -32,7 +38,7 @@ def _read_file():
         return None, {}
     with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return mtime, {k: bool(v) for k, v in data.items() if k in _DEFAULTS}
+    return mtime, {k: (str(v) if k == "public_url" else bool(v)) for k, v in data.items() if k in _DEFAULTS}
 
 
 def get_app_settings(constants: dict = None) -> dict:
@@ -49,5 +55,10 @@ def get_app_settings(constants: dict = None) -> dict:
         result = dict(_cache["values"])
     for key in _DEFAULTS:
         if constants and key.upper() in constants:
-            result[key] = bool(constants[key.upper()])
+            result[key] = str(constants[key.upper()]) if key == "public_url" else bool(constants[key.upper()])
     return result
+
+
+def system_hint() -> str:
+    """The "system" value stamped into pushes: the configured public base URL (or "")."""
+    return get_app_settings().get("public_url", "") or ""

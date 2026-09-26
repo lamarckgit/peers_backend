@@ -1,4 +1,5 @@
 {
   "bluetooth_discovery": true,
-  "cross_system_discovery": true
+  "cross_system_discovery": true,
+  "public_url": "https://api.peers.club/peers"
 }
